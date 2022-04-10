@@ -37,6 +37,7 @@
 #include <unordered_set>
 
 #include "../../runtime/thread_storage_scope.h"
+#include "../ir/buffer_common.h"
 #include "ir_utils.h"
 
 namespace tvm {
@@ -75,8 +76,8 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
   };
   // The scope of each allocation
   struct AllocEntry {
-    // Scope used for allocation.
-    StorageScope storage_scope;
+    // The physical dimension of the allocation.
+    size_t num_physical_dimensions{0};
     // scope level
     size_t level{0};
     // allocation stmt
@@ -86,25 +87,39 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
   void VisitStmt_(const AllocateNode* op) final {
     size_t level = scope_.size();
     const VarNode* buf = op->buffer_var.get();
-    auto it = alloc_info_.find(buf);
-    ICHECK(it != alloc_info_.end()) << "Could not find buffer `" << buf->name_hint
-                                    << "` in the list of allocated buffers. Perhaps you are "
-                                       "missing a storage_scope attr for this buffer.";
-    ICHECK(it->second.alloc == nullptr);
-    it->second.alloc = op;
-    it->second.level = level;
+
+    AllocEntry entry;
+    entry.alloc = op;
+    entry.level = level;
+    // Since StorageRewrite occurs after StorageFlatten/FlattenBuffer,
+    // all allocations specify the extent of physical dimensions, and
+    // is 1 for flat memory spaces.
+    entry.num_physical_dimensions = op->extents.size();
+    alloc_info_[buf] = entry;
+
     StmtExprVisitor::VisitStmt_(op);
   }
+
   void VisitStmt_(const StoreNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+  }
+
+  void VisitStmt_(const BufferStoreNode* op) final {
     scope_.push_back(StmtEntry());
     // visit subexpr
     StmtExprVisitor::VisitStmt_(op);
     // Add write access.
-    const VarNode* buf = op->buffer_var.get();
+    const VarNode* buf = op->buffer->data.get();
     auto it = alloc_info_.find(buf);
     if (it != alloc_info_.end() && it->second.alloc) {
       ICHECK_LT(it->second.level, scope_.size());
       scope_[it->second.level].touched.push_back(buf);
+
+      ICHECK_EQ(op->buffer->axis_separators.size() + 1, it->second.num_physical_dimensions)
+          << "Buffer " << op->buffer->name << " is allocated with "
+          << it->second.num_physical_dimensions
+          << " physical dimensions, but is accessed as having "
+          << op->buffer->axis_separators.size() + 1 << " physical dimensions" << std::endl;
     }
     StmtEntry e = scope_.back();
     scope_.pop_back();
@@ -113,6 +128,28 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
       linear_seq_.push_back(e);
     }
   }
+
+  void VisitExpr_(const LoadNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+  }
+
+  void VisitExpr_(const BufferLoadNode* op) final {
+    // Add write access.
+    StmtExprVisitor::VisitExpr_(op);
+    const VarNode* buf = op->buffer->data.get();
+    auto it = alloc_info_.find(buf);
+    if (it != alloc_info_.end() && it->second.alloc) {
+      ICHECK_LT(it->second.level, scope_.size()) << "Load memory in places other than store.";
+      scope_[it->second.level].touched.push_back(buf);
+
+      ICHECK_EQ(op->buffer->axis_separators.size() + 1, it->second.num_physical_dimensions)
+          << "Buffer " << op->buffer->name << " is allocated with "
+          << it->second.num_physical_dimensions
+          << " physical dimensions, but is accessed as having "
+          << op->buffer->axis_separators.size() + 1 << " physical dimensions" << std::endl;
+    }
+  }
+
   void VisitStmt_(const EvaluateNode* op) final {
     scope_.push_back(StmtEntry());
     // visit subexpr
@@ -124,24 +161,18 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
       linear_seq_.push_back(e);
     }
   }
-  void VisitExpr_(const LoadNode* op) final {
-    // Add write access.
-    StmtExprVisitor::VisitExpr_(op);
-    const VarNode* buf = op->buffer_var.get();
-    auto it = alloc_info_.find(buf);
-    if (it != alloc_info_.end() && it->second.alloc) {
-      ICHECK_LT(it->second.level, scope_.size()) << "Load memory in places other than store.";
-      scope_[it->second.level].touched.push_back(buf);
-    }
-  }
+
   void VisitExpr_(const CallNode* op) final {
     if (op->op.same_as(builtin::address_of())) {
-      const LoadNode* l = op->args[0].as<LoadNode>();
-      this->VisitExpr(l->index);
+      const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
+      for (const auto& index : load->indices) {
+        this->VisitExpr(index);
+      }
     } else {
       StmtExprVisitor::VisitExpr_(op);
     }
   }
+
   void VisitExpr_(const VarNode* buf) final {
     // Directly reference to the variable count as a read.
     auto it = alloc_info_.find(buf);
@@ -150,6 +181,7 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
       scope_[it->second.level].touched.push_back(buf);
     }
   }
+
   template <typename T>
   void VisitNewScope(const T* op) {
     scope_.push_back(StmtEntry());
@@ -170,6 +202,7 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
     ICHECK_NE(end_index, 0U);
     linear_seq_[begin_index].scope_pair_offset = end_index - begin_index;
   }
+
   void VisitStmt_(const AttrStmtNode* op) final {
     // Only record the outer most thread extent.
     if (op->attr_key == attr::thread_extent && !in_thread_env_) {
@@ -180,14 +213,11 @@ class LinearAccessPatternFinder final : public StmtExprVisitor {
       VisitNewScope(op);
     } else if (op->attr_key == attr::virtual_thread) {
       VisitNewScope(op);
-    } else if (op->attr_key == attr::storage_scope) {
-      const VarNode* buf = op->node.as<VarNode>();
-      alloc_info_[buf].storage_scope = StorageScope::Create(op->value.as<StringImmNode>()->value);
-      StmtExprVisitor::VisitStmt_(op);
     } else {
       StmtExprVisitor::VisitStmt_(op);
     }
   }
+
   void VisitStmt_(const IfThenElseNode* op) final { VisitNewScope(op); }
 
   void VisitStmt_(const ForNode* op) final { VisitNewScope(op); }
@@ -250,6 +280,8 @@ class InplaceOpVerifier : public StmtExprVisitor {
       VisitStmt_(static_cast<const WhileNode*>(stmt));
     } else if (stmt->IsInstance<StoreNode>()) {
       VisitStmt_(static_cast<const StoreNode*>(stmt));
+    } else if (stmt->IsInstance<BufferStoreNode>()) {
+      VisitStmt_(static_cast<const BufferStoreNode*>(stmt));
     } else {
       return false;
     }
@@ -276,17 +308,21 @@ class InplaceOpVerifier : public StmtExprVisitor {
   }
 
   void VisitStmt_(const StoreNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+  }
+
+  void VisitStmt_(const BufferStoreNode* op) final {
     ++mem_nest_;
-    this->VisitExpr(op->index);
+    for (const auto& index : op->indices) {
+      this->VisitExpr(index);
+    }
     --mem_nest_;
-    if (op->buffer_var.get() == dst_) {
+    if (op->buffer->data.get() == dst_) {
       store_ = op;
       this->VisitExpr(op->value);
-      this->VisitExpr(op->predicate);
       store_ = nullptr;
     } else {
       this->VisitExpr(op->value);
-      this->VisitExpr(op->predicate);
     }
   }
 
@@ -300,7 +336,11 @@ class InplaceOpVerifier : public StmtExprVisitor {
   }
 
   void VisitExpr_(const LoadNode* op) final {
-    const VarNode* buf = op->buffer_var.get();
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+  }
+
+  void VisitExpr_(const BufferLoadNode* op) final {
+    const VarNode* buf = op->buffer->data.get();
     // cannot read from dst_ (no reduction)
     if (buf == dst_) {
       result_ = false;
@@ -312,10 +352,18 @@ class InplaceOpVerifier : public StmtExprVisitor {
       return;
     }
     if (src_ == buf) {
-      if (store_ == nullptr || store_->value.dtype() != op->dtype ||
-          !tir::ExprDeepEqual()(store_->index, op->index)) {
+      if (store_ == nullptr || store_->value.dtype() != op->dtype) {
         result_ = false;
         return;
+      }
+      ICHECK_EQ(store_->indices.size(), op->indices.size())
+          << "Store/Load occur to the same buffer " << buf->name_hint
+          << " with differing number of indices";
+      for (size_t i = 0; i < store_->indices.size(); i++) {
+        if (!tir::ExprDeepEqual()(store_->indices[i], op->indices[i])) {
+          result_ = false;
+          return;
+        }
       }
     }
     ++mem_nest_;
@@ -334,10 +382,17 @@ class InplaceOpVerifier : public StmtExprVisitor {
   // it is not safe to inplace when there is nested load like A[B[i]]
   int mem_nest_{0};
   // The current store to be inspected
-  const StoreNode* store_{nullptr};
+  const BufferStoreNode* store_{nullptr};
 };
 
-// Planner to plan and rewrite memory allocation.
+/* \brief Rewrite and merge memory allocation.
+ *
+ * Using LinearAccessPatternFinder, determines which buffers could share an
+ * allocation.  This includes both sequential usage of the same buffer and
+ * merging small allocations at the same scope into a single larger allocation.
+ * The merging of small allocations requires the codegen to cast the resulting
+ * value from the storage type to the output type after access.
+ */
 class StoragePlanRewriter : public StmtExprMutator {
  public:
   using StmtEntry = LinearAccessPatternFinder::StmtEntry;
@@ -358,22 +413,62 @@ class StoragePlanRewriter : public StmtExprMutator {
     }
     return stmt;
   }
+
   Stmt VisitStmt_(const StoreNode* op) final {
-    Stmt stmt = StmtExprMutator::VisitStmt_(op);
-    op = stmt.as<StoreNode>();
-    auto it = alloc_map_.find(op->buffer_var.get());
-    if (it == alloc_map_.end()) return stmt;
-    return Store(it->second->alloc_var, op->value,
-                 RemapIndex(op->value.dtype(), op->index, it->second), op->predicate);
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+    return Stmt();
   }
+
   PrimExpr VisitExpr_(const LoadNode* op) final {
-    PrimExpr expr = StmtExprMutator::VisitExpr_(op);
-    op = expr.as<LoadNode>();
-    auto it = alloc_map_.find(op->buffer_var.get());
-    if (it == alloc_map_.end()) return expr;
-    return Load(op->dtype, it->second->alloc_var, RemapIndex(op->dtype, op->index, it->second),
-                op->predicate);
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+    return PrimExpr();
   }
+
+  template <typename Node>
+  Node VisitBufferAccess(Node node) {
+    auto it = alloc_map_.find(node->buffer->data.get());
+    if (it != alloc_map_.end()) {
+      Buffer buf = RemapBuffer(node->buffer, it->second->alloc_var);
+
+      Array<PrimExpr> indices = node->indices;
+      indices.Set(indices.size() - 1,
+                  RemapIndex(node->buffer->dtype, indices[indices.size() - 1], it->second));
+
+      auto writer = node.CopyOnWrite();
+      writer->buffer = buf;
+      writer->indices = indices;
+    }
+    return node;
+  }
+
+  Buffer RemapBuffer(Buffer buf, Var new_backing_array) {
+    auto key = buf.get();
+    auto it = buffer_remap_.find(key);
+    if (it != buffer_remap_.end()) {
+      ICHECK_EQ(it->second->data.get(), new_backing_array.get())
+          << "Cannot remap buffer " << buf->name << " to use backing array "
+          << new_backing_array->name_hint << ", previously used backing array "
+          << it->second->data->name_hint;
+      return it->second;
+    }
+
+    Buffer remapped = Buffer(new_backing_array, buf->dtype, buf->shape, buf->strides,
+                             buf->elem_offset, new_backing_array->name_hint, buf->data_alignment,
+                             buf->offset_factor, buf->buffer_type, buf->axis_separators, buf->span);
+    buffer_remap_[key] = remapped;
+    return remapped;
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    auto node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    return VisitBufferAccess(std::move(node));
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    return VisitBufferAccess(std::move(node));
+  }
+
   PrimExpr VisitExpr_(const VarNode* op) final {
     auto it = alloc_map_.find(op);
     if (it != alloc_map_.end()) {
@@ -409,10 +504,8 @@ class StoragePlanRewriter : public StmtExprMutator {
   }
 
   Stmt VisitStmt_(const AttrStmtNode* op) final {
-    if (op->attr_key == attr::storage_scope) {
-      return this->VisitStmt(op->body);
-    } else if (op->attr_key == attr::thread_extent || op->attr_key == attr::virtual_thread ||
-               attr::IsPragmaKey(op->attr_key)) {
+    if (op->attr_key == attr::thread_extent || op->attr_key == attr::virtual_thread ||
+        attr::IsPragmaKey(op->attr_key)) {
       // remake all the allocation at the attach scope.
       if (attach_map_.count(op)) {
         auto& svec = attach_map_[op];
@@ -459,6 +552,10 @@ class StoragePlanRewriter : public StmtExprMutator {
     uint64_t const_nbits{0};
     // The storage scope.
     StorageScope scope;
+    // The physical dimensionality of the allocations.  Since
+    // StorageRewrite is applied after StorageFlatten/FlattenBuffer,
+    // this is size of `AllocateNode::extents`.  If moved
+    size_t ndim;
     // Allocs that shares this entry.
     std::vector<const AllocateNode*> allocs;
     // The children of this entry, not including itself.
@@ -483,6 +580,11 @@ class StoragePlanRewriter : public StmtExprMutator {
     uint64_t bits_offset{0};
   };
 
+  // Checks whether the storage_scope is especially tagged for a specific memory.
+  bool IsSpecialTaggedMemory(const StorageScope& scope) {
+    return scope.tag.length() != 0 && scope.tag != ".dyn" && scope.tag != ".workspace";
+  }
+
   // Alllocate entry of node.
   // Event entry in liveness analysis
   struct EventEntry {
@@ -496,8 +598,6 @@ class StoragePlanRewriter : public StmtExprMutator {
     std::vector<Stmt> nest;
     for (StorageEntry* e : svec) {
       if (e->new_alloc.defined()) {
-        nest.emplace_back(AttrStmt(e->alloc_var, attr::storage_scope,
-                                   StringImm(e->scope.to_string()), Evaluate(0)));
         nest.push_back(e->new_alloc);
       }
     }
@@ -506,7 +606,7 @@ class StoragePlanRewriter : public StmtExprMutator {
   // Remap the index
   PrimExpr RemapIndex(DataType dtype, PrimExpr index, StorageEntry* e) {
     if (e->bits_offset == 0) return index;
-    uint64_t elem_bits = dtype.bits() * dtype.lanes();
+    uint64_t elem_bits = dtype.bits();
     ICHECK_EQ(e->bits_offset % elem_bits, 0U);
     return make_const(index.dtype(), e->bits_offset / elem_bits) + index;
   }
@@ -523,7 +623,7 @@ class StoragePlanRewriter : public StmtExprMutator {
       // try to find merge, for tagged memory
       for (size_t i = 0; i < vec.size(); ++i) {
         StorageEntry* e = vec[i];
-        if (e->scope.tag.length() != 0) {
+        if (IsSpecialTaggedMemory(e->scope)) {
           ICHECK_NE(e->const_nbits, 0U) << "Special tagged memory must be const size";
           for (size_t j = 0; j < i; ++j) {
             if (e->scope == vec[j]->scope) {
@@ -555,9 +655,9 @@ class StoragePlanRewriter : public StmtExprMutator {
           // simply use the original allocation.
           PrimExpr sz = foldl([](PrimExpr a, PrimExpr b, Span span) { return mul(a, b, span); },
                               make_const(DataType::Int(32), 1), e->allocs[0]->extents);
-          e->new_alloc =
-              Allocate(e->alloc_var, alloc_type, {sz}, e->allocs[0]->condition, Evaluate(0));
-          if (e->scope.tag.length() != 0) {
+          e->new_alloc = Allocate(e->alloc_var, alloc_type, e->allocs[0]->extents,
+                                  e->allocs[0]->condition, Evaluate(0));
+          if (IsSpecialTaggedMemory(e->scope)) {
             MemoryInfo info = GetMemoryInfo(e->scope.to_string());
             uint64_t total_elem = e->const_nbits / e->elem_type.bits();
             ICHECK_LE(total_elem * e->elem_type.bits(), info->max_num_bits)
@@ -567,8 +667,13 @@ class StoragePlanRewriter : public StmtExprMutator {
           // Build a merged allocation
           PrimExpr combo_size;
           for (const AllocateNode* op : e->allocs) {
-            PrimExpr sz = foldl([](PrimExpr a, PrimExpr b, Span span) { return mul(a, b, span); },
-                                make_const(DataType::Int(32), 1), op->extents);
+            ICHECK_EQ(op->extents.size(), 1)
+                << "Buffer var " << op->buffer_var->name_hint
+                << " was identified as a re-usable allocation, but has " << op->extents.size()
+                << " physical dimensions.  "
+                << "Currently, only flat 1-d memory spaces should be identified as re-usable "
+                   "allocations.";
+            PrimExpr sz = op->extents[0];
             auto nbits = op->dtype.bits() * op->dtype.lanes();
             if (const auto* imm = sz.as<IntImmNode>()) {
               if (imm->value > std::numeric_limits<int>::max() / nbits) {
@@ -598,7 +703,7 @@ class StoragePlanRewriter : public StmtExprMutator {
           combo_size = analyzer_.Simplify(combo_size);
           e->new_alloc =
               Allocate(e->alloc_var, alloc_type, {combo_size}, const_true(), Evaluate(0));
-          if (e->scope.tag.length() != 0) {
+          if (IsSpecialTaggedMemory(e->scope)) {
             MemoryInfo info = GetMemoryInfo(e->scope.to_string());
             uint64_t total_elem = e->const_nbits / e->elem_type.bits();
             ICHECK_LE(total_elem * e->elem_type.bits(), info->max_num_bits)
@@ -716,7 +821,9 @@ class StoragePlanRewriter : public StmtExprMutator {
 
         for (const VarNode* var : it->second.gen) {
           ICHECK(alloc_info.count(var));
-          const AllocEntry& ae = alloc_info.at(var);
+          const AllocEntry& entry = alloc_info.at(var);
+          const AllocateNode* alloc = entry.alloc;
+          auto storage_scope = StorageScope::Create(GetPtrStorageScope(GetRef<Var>(var)));
           StorageEntry* dst_entry = nullptr;
           // inplace detection
           if (detect_inplace) {
@@ -726,13 +833,12 @@ class StoragePlanRewriter : public StmtExprMutator {
               if (!inplace_flag.count(src) && alloc_map_.count(src)) {
                 InplaceOpVerifier visitor;
                 StorageEntry* src_entry = alloc_map_.at(src);
-                if (src_entry->scope == ae.storage_scope &&
+                if (src_entry->scope == storage_scope &&
                     src_entry->attach_scope_ == thread_scope_ &&
-                    src_entry->elem_type == ae.alloc->dtype.element_of() &&
+                    src_entry->elem_type == alloc->dtype.element_of() &&
                     visitor.Check(s.stmt, var, src)) {
-                  uint64_t const_nbits =
-                      static_cast<uint64_t>(ae.alloc->constant_allocation_size()) *
-                      ae.alloc->dtype.bits() * ae.alloc->dtype.lanes();
+                  uint64_t const_nbits = static_cast<uint64_t>(alloc->ConstantAllocationSize()) *
+                                         alloc->dtype.bits() * alloc->dtype.lanes();
                   if (src_entry->const_nbits == const_nbits && !inplace_found) {
                     // successfully inplace
                     dst_entry = src_entry;
@@ -744,9 +850,10 @@ class StoragePlanRewriter : public StmtExprMutator {
             }
           }
           if (dst_entry == nullptr) {
-            dst_entry = FindAlloc(ae.alloc, thread_scope_, ae.storage_scope);
+            dst_entry =
+                FindAlloc(alloc, thread_scope_, storage_scope, entry.num_physical_dimensions);
           }
-          dst_entry->allocs.emplace_back(ae.alloc);
+          dst_entry->allocs.emplace_back(alloc);
           alloc_map_[var] = dst_entry;
         }
       }
@@ -797,24 +904,34 @@ class StoragePlanRewriter : public StmtExprMutator {
   }
 
   StorageEntry* FindAlloc(const AllocateNode* op, const Object* attach_scope,
-                          const StorageScope& scope) {
+                          const StorageScope& scope, size_t num_physical_dimensions) {
     ICHECK(op != nullptr);
     // skip plan for local variable,
     // compiler can do a better job with register allocation.
     const uint64_t match_range = 16;
     uint64_t op_elem_bits = op->dtype.bits() * op->dtype.lanes();
-    uint64_t const_nbits = static_cast<uint64_t>(op->constant_allocation_size() * op_elem_bits);
+    uint64_t const_nbits = static_cast<uint64_t>(op->ConstantAllocationSize() * op_elem_bits);
+
+    // If the size of the array isn't known at compile-time, it must
+    // have its own allocation with size determined at runtime.
+    bool is_known_size = (const_nbits != 0);
+
+    // Currently, only flat memory spaces can be re-used.  Packing
+    // into N-d space (e.g. 2-d texture memory on GPUs) will require
+    // more in-depth algorithms.
+    bool is_flat_memory_space = (num_physical_dimensions == 1);
+
     // disable reuse of small arrays, they will be lowered to registers in LLVM
     // This rules only apply if we are using non special memory
-    if (scope.tag.length() == 0) {
-      if (scope.rank >= StorageRank::kWarp || op->dtype.is_handle()) {
-        return NewAlloc(op, attach_scope, scope, const_nbits);
-      }
-      if (const_nbits > 0 && const_nbits <= 32) {
-        return NewAlloc(op, attach_scope, scope, const_nbits);
-      }
+    bool is_small_array =
+        (scope.tag.length() == 0) && (scope.rank >= StorageRank::kWarp || op->dtype.is_handle() ||
+                                      (is_known_size && const_nbits <= 32));
+
+    if (is_small_array || !is_flat_memory_space) {
+      return NewAlloc(op, attach_scope, scope, const_nbits);
     }
-    if (const_nbits != 0) {
+
+    if (is_known_size) {
       // constant allocation.
       auto begin = const_free_map_.lower_bound(const_nbits / match_range);
       auto mid = const_free_map_.lower_bound(const_nbits);
@@ -892,111 +1009,633 @@ class StoragePlanRewriter : public StmtExprMutator {
   std::unordered_map<const VarNode*, StorageEntry*> alloc_map_;
   // The allocations
   std::vector<std::unique_ptr<StorageEntry> > alloc_vec_;
+  // The buffer objects being remapped
+  std::unordered_map<const BufferNode*, Buffer> buffer_remap_;
   // analyzer
   arith::Analyzer analyzer_;
 };
 
-// Turn alloc into vector alloc
-// if all its access is the same vector type.
-class VectorAllocRewriter : public StmtExprMutator {
+/* Helper struct containing information on how a buffer is declared and used
+ *
+ */
+struct BufferVarInfo {
+  enum DeclarationLocation {
+    kPrimFuncParam = (1 << 0),
+    kPrimFuncBufferMap = (1 << 1),
+    kAllocateNode = (1 << 2),
+    kAllocateConstNode = (1 << 3),
+    kLetNode = (1 << 4),
+  };
+
+  // The tir::Var that represents this buffer.
+  Var var;
+
+  // The data type of an element of the buffer.
+  DataType element_dtype;
+
+  /* The extent of the buffer.
+   *
+   * If multidimensional, the extent of the last dimension of the buffer.  If the
+   * size is unknown (e.g. pointer arguments to PrimFunc with no corresponding
+   * entry in buffer_map), then extent is zero.
+   */
+  PrimExpr extent;
+
+  // Where the buffer was declared
+  DeclarationLocation declaration_location;
+
+  // When accessed, which element type is it accessed as.  This may
+  // differ both in base type (e.g. int32* cast to float32* after
+  // packing in StorageRewrite) or in number of lanes (e.g. float16*
+  // cast to float16x4*).
+  std::unordered_set<DataType> access_dtype;
+
+  DataType get_preferred_dtype() const {
+    std::unordered_set<DataType> base_access_dtype;
+    for (auto dtype : access_dtype) {
+      base_access_dtype.insert(dtype.element_of());
+    }
+    // If the array is accessed as multiple base types within a
+    // function, no point in changing the declared type.  CodeGenC can
+    // handle this with a type-cast prior to indexing.  Vulkan will
+    // raise an error at code-gen time, if a later pass doesn't split
+    // it out.
+    if (base_access_dtype.size() != 1) {
+      return element_dtype;
+    }
+
+    DataType preferred_base_type = *base_access_dtype.begin();
+
+    // If there is only one vectorizable size used to access the
+    // buffer, and if that access size is compatible with the array
+    // size, then the buffer is vectorizable.  In the future, this
+    // could be improved to allow vectorized buffer access of size
+    // GCD(*lanes_used), if necessary.
+    int preferred_lanes = element_dtype.lanes();
+    if ((element_dtype.lanes() == 1) && (access_dtype.size() == 1)) {
+      arith::Analyzer analyzer_;
+      arith::ModularSet me = analyzer_.modular_set(extent);
+
+      int lanes = access_dtype.begin()->lanes();
+      if ((me->coeff % lanes == 0) && (me->base % lanes == 0)) {
+        preferred_lanes = lanes;
+      }
+    }
+
+    return preferred_base_type.with_lanes(preferred_lanes);
+  }
+};
+
+/* Checks whether buffers are accessed as scalar or vector parameters in a
+ * function.
+ *
+ */
+class VectorTypeAccessChecker : public StmtExprVisitor {
  public:
-  PrimExpr VisitExpr_(const LoadNode* op) final {
-    UpdateTypeMap(op->buffer_var.get(), op->dtype);
-    return StmtExprMutator::VisitExpr_(op);
+  /* Constructor
+   *
+   * @param params The parameters passed to a PrimFunc
+   *
+   * @param buffer_map The buffer_map associated with a PrimFunc
+   *
+   * @param allow_untyped_handles If a buffer or pointer variable is
+   * missing a type annotation, assume that it has the same underlying
+   * type as it is later accessed, with scalar element types.
+   */
+  VectorTypeAccessChecker(const Array<tir::Var>& params, const Map<Var, Buffer>& buffer_map,
+                          bool allow_untyped_pointers = false)
+      : allow_untyped_pointers_(allow_untyped_pointers) {
+    // If a parameter is in the buffer map, we want to track the
+    // version in the map.
+    for (auto it : buffer_map) {
+      Buffer& buffer = it.second;
+      Var buffer_var = buffer->data;
+      DataType dtype = buffer->dtype;
+      PrimExpr extent = buffer->shape.size() ? buffer->shape[buffer->shape.size() - 1] : 0;
+      OnArrayDeclaration(buffer_var, dtype, extent, BufferVarInfo::kPrimFuncParam);
+    }
+
+    // If a pointer parameter isn't in the buffer map, then we want to
+    // track the parameter itself.
+    for (Var buffer_var : params) {
+      auto pointer_type = GetPointerType(buffer_var->type_annotation);
+      if (pointer_type.first && (buffer_map.count(buffer_var) == 0)) {
+        DataType dtype = pointer_type.second;
+        PrimExpr extent = 0;
+        OnArrayDeclaration(buffer_var, dtype, extent, BufferVarInfo::kPrimFuncBufferMap);
+      }
+    }
   }
 
-  Stmt VisitStmt_(const StoreNode* op) final {
-    UpdateTypeMap(op->buffer_var.get(), op->value.dtype());
-    return StmtExprMutator::VisitStmt_(op);
+  void VisitExpr_(const LoadNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
   }
-  PrimExpr VisitExpr_(const CallNode* op) final {
+
+  void VisitStmt_(const StoreNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+  }
+
+  void VisitExpr_(const BufferLoadNode* op) final {
+    OnArrayAccess(op->dtype, op->buffer->data.get(), op->indices);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const BufferStoreNode* op) final {
+    OnArrayAccess(op->value.dtype(), op->buffer->data.get(), op->indices);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const CallNode* op) final {
     if (op->op.same_as(builtin::tvm_access_ptr())) {
       DataType dtype = op->args[0].dtype();
       const VarNode* buffer = op->args[1].as<VarNode>();
-      UpdateTypeMap(buffer, dtype);
+      PrimExpr index = op->args[2];
+      OnArrayAccess(dtype, buffer, {index});
     }
-    return StmtExprMutator::VisitExpr_(op);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const AllocateNode* op) final {
+    const Array<PrimExpr>& extents = op->extents;
+    PrimExpr extent = extents[extents.size() - 1];
+    OnArrayDeclaration(op->buffer_var, op->dtype, extent, BufferVarInfo::kAllocateNode);
+
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitStmt_(const AllocateConstNode* op) final {
+    const Array<PrimExpr>& extents = op->extents;
+    PrimExpr extent = extents.size() ? extents[extents.size() - 1] : NullValue<PrimExpr>();
+    OnArrayDeclaration(op->buffer_var, op->dtype, extent, BufferVarInfo::kAllocateConstNode);
+
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void VisitExpr_(const LetNode* op) final {
+    HandleLetNode(op->var);
+    StmtExprVisitor::VisitExpr_(op);
+  }
+
+  void VisitStmt_(const LetStmtNode* op) final {
+    HandleLetNode(op->var);
+    StmtExprVisitor::VisitStmt_(op);
+  }
+
+  void HandleLetNode(Var let_var) {
+    if (let_var->dtype.is_handle()) {
+      auto pointer_type = GetPointerType(let_var->type_annotation);
+      if (pointer_type.first) {
+        OnArrayDeclaration(let_var, pointer_type.second, 0, BufferVarInfo::kLetNode);
+      } else if (allow_untyped_pointers_) {
+        OnArrayDeclaration(let_var, let_var->dtype, 0, BufferVarInfo::kLetNode);
+      } else {
+        LOG(FATAL) << "Let statement of variable " << let_var->name_hint
+                   << " is missing a type annotation, "
+                   << "or type annotation is not a pointer to primitive";
+      }
+    }
+  }
+
+  /* Update the type map for a buffer based on its declaration
+   *
+   * @param buffer The VarNode representing the buffer.
+   *
+   * @param element_dtype The dtype of a single element of the buffer.
+   * If unknown, when used with the allow_untyped_handles option,
+   * should be a handle dtype.
+   *
+   * @param extent The extent of the buffer.  Zero if size is unknown.
+   *
+   * @param declaration_location How the buffer was allocated, so that
+   * some locations can be rewritten without others.
+   */
+  void OnArrayDeclaration(Var buffer, DataType element_dtype, PrimExpr extent,
+                          BufferVarInfo::DeclarationLocation declaration_location) {
+    ICHECK(info_map_.find(buffer.get()) == info_map_.end())
+        << "Array declaration of " << buffer->name_hint << " occurred multiple times.";
+
+    if (element_dtype == DataType::Bool()) {
+      element_dtype = DataType::Int(8).with_lanes(element_dtype.lanes());
+    }
+
+    info_map_[buffer.get()] = {buffer, element_dtype, extent, declaration_location};
+  }
+
+  /* Update the type map for a buffer based on its usage
+   *
+   * @param value_dtype The dtype of the value being stored to or
+   * loaded from the buffer.
+   *
+   * @param buffer The VarNode representing the buffer.
+   *
+   * @param index The index at which the value is being stored/loaded.
+   *
+   * @param predicate The predicate used for the store/load.
+   */
+  void OnArrayAccess(DataType value_dtype, const VarNode* buffer, const Array<PrimExpr>& indices) {
+    auto it = info_map_.find(buffer);
+    ICHECK(it != info_map_.end()) << "Load/Store of buffer " << buffer->name_hint << " (" << buffer
+                                  << ") occurred before its declaration.";
+    BufferVarInfo& var_info = it->second;
+
+    if (value_dtype.element_of() == DataType::Bool()) {
+      value_dtype = DataType::Int(8).with_lanes(value_dtype.lanes());
+    }
+
+    if (var_info.element_dtype.is_handle()) {
+      ICHECK(allow_untyped_pointers_) << "Variable " << buffer->name_hint
+                                      << " was missing a type annotation in its declaration";
+      var_info.element_dtype = value_dtype.element_of();
+    }
+
+    for (int i = 0; i < static_cast<int>(indices.size()) - 1; i++) {
+      ICHECK(indices[i].dtype().is_scalar())
+          << "Only the last index of a buffer access may be a vector type.";
+    }
+    int index_lanes = indices.size() ? indices.back().dtype().lanes() : 1;
+
+    DataType access_dtype = value_dtype;
+
+    int lanes_used = var_info.element_dtype.lanes();
+
+    // This can happen due to a previous pass that had rewrite_store_load =
+    // false.  This occurs from the StorageRewrite in tvm::lower, followed by the
+    // PointerValueTypeRewrite in BuildSPIRV.  The rewrite_store_load = false is
+    // necessary because the C-based codegens do not yet support vectorized
+    // pointer types (e.g. float16x4*).  Once they do, this if statement should
+    // instead be replaced by the below ICHECK_EQ.
+    if (index_lanes * var_info.element_dtype.lanes() != value_dtype.lanes()) {
+      ICHECK_EQ(index_lanes, value_dtype.lanes());
+      lanes_used = 1;
+      var_info.element_dtype = var_info.element_dtype.with_lanes(1);
+    }
+
+    // TODO(Lunderberg): Uncomment this check once it can be applied.
+    // See https://discuss.tvm.apache.org/t/pre-rfc-vectorized-tir-buffers/10615
+    // for discussion.
+
+    // ICHECK_EQ(index_lanes * var_info.element_dtype.lanes(), value_dtype.lanes())
+    //     << "Attempting to retrieve " << value_dtype.lanes() << " lanes of data with "
+    //     << index_lanes << " indices into an array whose elements have "
+    //     << var_info.element_dtype.lanes() << " lanes.  "
+    //     << "Expected output with " << index_lanes * var_info.element_dtype.lanes()
+    //     << " lanes.";
+
+    // If the index is a RampNode with stride of 1 and offset
+    // divisible by the number of number of lanes, and the predicate
+    // does not apply any masking, then this array access could be
+    // vectorized.
+    if (indices.size()) {
+      const RampNode* ramp_index = indices[indices.size() - 1].as<RampNode>();
+      if (ramp_index && is_one(ramp_index->stride)) {
+        arith::ModularSet me = analyzer_.modular_set(ramp_index->base);
+        if ((me->coeff % ramp_index->lanes == 0) && (me->base % ramp_index->lanes == 0)) {
+          lanes_used = ramp_index->lanes;
+        }
+      }
+    }
+
+    var_info.access_dtype.insert(access_dtype.with_lanes(lanes_used));
+  }
+
+  // Map of buffer variable information determined
+  std::unordered_map<const VarNode*, BufferVarInfo> info_map_;
+
+  //
+  bool allow_untyped_pointers_{false};
+
+  // internal analyzer
+  arith::Analyzer analyzer_;
+};
+
+/* \brief Rewrites buffer/pointer variables from scalar types to vectorized
+ * types.
+ *
+ * Some runtimes do not allow casting between composite types and the underlying
+ * base type (e.g. Vulkan, casting from 1-lane float16* to 4-lane float16x4*).
+ * In these cases, in order to have vectorized load/store on an array, the
+ * element type of that array must be vectorized.  This is in contrast to C-style
+ * runtimes, in which `float16x4* vec = *(float16x4*)(float_arr + offset)` is
+ * valid.
+ *
+ * By default, VectorTypeRewriter will attempt to rewrite all buffer variables to
+ * vectorized access, if the load/store occurring in the PrimFunc are all
+ * vectorized.  This includes adjusting the indices being used to access the
+ * array.  (e.g. If `float16* scalar_arr` is being converted to `float16x4*
+ * vec_arr`, then `scalar_arr[Ramp(offset, 1, 4)]` will be converted to
+ * `vec_arr[offset/4]`.)
+ *
+ * Currently, several of the C-style runtimes do not support buffers whose
+ * elements are vectorized types, or rely on the presence of the Ramp nodes to
+ * identify vectorized loads.  The boolean parameters in the constructor are to
+ * mimic the previous behavior of VectorTypeRewriter, to avoid breaking these
+ * runtimes.  Once all runtimes support vectorized buffer elements, these
+ * parameters can be removed.
+ */
+class VectorTypeRewriter : public StmtExprMutator {
+ public:
+  /* Constructor
+   *
+   * @param checker The VectorTypeAccessChecker that has previously read out
+   * information from the PrimFunc
+   *
+   * @param rewrite_params Whether pointer-type parameters passed into the
+   * function should be rewritten from scalar types to vectorized types.
+   *
+   * @param rewrite_buffer_map Whether buffers present in the buffer_map should
+   * have their data variable be rewritten from scalar types to vectorized types.
+   *
+   * @param rewrite_allocate_node Whether the buffer variable associated with
+   * AllocateNodes should be rewritten from scalar types to vectorized types.
+   *
+   * @param rewrite_indices Whether the indices to the Load and Store nodes
+   * should be rewritten to correspond to the new buffer_var type.
+   *
+   * @param rewrite_let_node Whether pointer declarations in let nodes
+   * should be re-written.
+   */
+  VectorTypeRewriter(const std::unordered_map<const VarNode*, BufferVarInfo>& info_map,
+                     bool rewrite_params = true, bool rewrite_buffer_map = true,
+                     bool rewrite_allocate_node = true, bool rewrite_indices = true,
+                     bool rewrite_let_node = true, bool rewrite_allocate_const_node = true)
+      : rewrite_indices_(rewrite_indices) {
+    int rewrite_mask = 0;
+    if (rewrite_params) {
+      rewrite_mask |= BufferVarInfo::kPrimFuncParam;
+    }
+    if (rewrite_buffer_map) {
+      rewrite_mask |= BufferVarInfo::kPrimFuncBufferMap;
+    }
+    if (rewrite_allocate_node) {
+      rewrite_mask |= BufferVarInfo::kAllocateNode;
+    }
+    if (rewrite_let_node) {
+      rewrite_mask |= BufferVarInfo::kLetNode;
+    }
+    if (rewrite_allocate_const_node) {
+      rewrite_mask |= BufferVarInfo::kAllocateConstNode;
+    }
+
+    // Rewrite any buffer variables whose preferred type isn't their current type.
+    for (const auto& pair : info_map) {
+      const auto& var_info = pair.second;
+      DataType preferred = var_info.get_preferred_dtype();
+      if (preferred != var_info.element_dtype && (rewrite_mask & var_info.declaration_location)) {
+        Var old_buffer_var = var_info.var;
+        Var new_buffer_var(old_buffer_var->name_hint,
+                           PointerType(PrimType(preferred), GetPtrStorageScope(old_buffer_var)),
+                           old_buffer_var->span);
+
+        rewrite_map_[var_info.var.get()] = {var_info.var, new_buffer_var, var_info.element_dtype,
+                                            preferred};
+      }
+    }
+  }
+
+  PrimExpr VisitExpr_(const LoadNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+    return PrimExpr();
+  }
+
+  Stmt VisitStmt_(const StoreNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+    return Stmt();
+  }
+
+  template <typename Node>
+  Node VisitBufferAccess(Node node) {
+    if (!rewrite_indices_) {
+      return node;
+    }
+
+    auto it = rewrite_map_.find(node->buffer->data.get());
+    if (it == rewrite_map_.end()) {
+      return node;
+    }
+    const auto& info = it->second;
+
+    Array<PrimExpr> indices = node->indices;
+
+    const RampNode* ramp_index = indices[indices.size() - 1].as<RampNode>();
+    if (ramp_index && is_one(ramp_index->stride)) {
+      PrimExpr new_index =
+          ramp_index->base / make_const(ramp_index->base.dtype(), ramp_index->lanes);
+      if (ramp_index->lanes != info.factor()) {
+        new_index = Ramp(new_index, ramp_index->stride, ramp_index->lanes / info.factor(),
+                         ramp_index->span);
+      }
+
+      indices.Set(indices.size() - 1, new_index);
+    }
+
+    auto writer = node.CopyOnWrite();
+    writer->buffer = RemapBuffer(node->buffer);
+    writer->indices = indices;
+
+    return node;
+  }
+
+  PrimExpr VisitExpr_(const BufferLoadNode* op) final {
+    auto node = Downcast<BufferLoad>(StmtExprMutator::VisitExpr_(op));
+    auto modified = VisitBufferAccess(node);
+
+    // Not needed for BufferStoreNode, so we can't just call
+    // LegalizeDtype() in VisitBufferAccess.
+    if (node.same_as(modified)) {
+      return std::move(node);
+    } else {
+      auto writer = modified.CopyOnWrite();
+      writer->LegalizeDType();
+      return std::move(modified);
+    }
+  }
+
+  Stmt VisitStmt_(const BufferStoreNode* op) final {
+    auto node = Downcast<BufferStore>(StmtExprMutator::VisitStmt_(op));
+    return VisitBufferAccess(std::move(node));
+  }
+
+  Buffer RemapBuffer(Buffer buf) {
+    auto cache_key = buf.get();
+
+    auto cache_it = buffer_map_.find(cache_key);
+    if (cache_it != buffer_map_.end()) {
+      return cache_it->second;
+    }
+
+    auto info_it = rewrite_map_.find(buf->data.get());
+    if (info_it != rewrite_map_.end()) {
+      auto& info = info_it->second;
+
+      Array<PrimExpr> shape = buf->shape;
+      PrimExpr last_dim = shape[shape.size() - 1];
+      shape.Set(shape.size() - 1, last_dim / make_const(last_dim.dtype(), info.factor()));
+
+      auto writer = buf.CopyOnWrite();
+      writer->data = info.new_buffer_var;
+      writer->dtype = info.new_element_dtype;
+      writer->shape = shape;
+    }
+
+    buffer_map_[cache_key] = buf;
+    return buf;
+  }
+
+  PrimExpr VisitExpr_(const CallNode* op) final {
+    if (op->op.same_as(builtin::tvm_access_ptr())) {
+      PrimExpr expr = StmtExprMutator::VisitExpr_(op);
+      op = expr.as<CallNode>();
+
+      if (!rewrite_indices_) {
+        return expr;
+      }
+
+      const VarNode* buffer_var = op->args[1].as<VarNode>();
+      auto it = rewrite_map_.find(buffer_var);
+      if (it == rewrite_map_.end()) {
+        return expr;
+      }
+      const auto& info = it->second;
+
+      PrimExpr index = op->args[2];
+      PrimExpr extent = op->args[3];
+      PrimExpr flag = op->args[4];
+
+      PrimExpr e_dtype = tir::TypeAnnotation(info.new_element_dtype);
+      int factor = info.factor();
+      extent = extent / make_const(extent.dtype(), factor);
+      index = index / make_const(index.dtype(), factor);
+      Array<PrimExpr> acc_args{e_dtype, info.new_buffer_var, index, extent, flag};
+      return Call(info.new_element_dtype, builtin::tvm_access_ptr(), acc_args);
+
+    } else {
+      return StmtExprMutator::VisitExpr_(op);
+    }
   }
 
   Stmt VisitStmt_(const AllocateNode* op) final {
     Stmt stmt = StmtExprMutator::VisitStmt_(op);
     op = stmt.as<AllocateNode>();
-    const auto& tvec = acc_map_[op->buffer_var.get()];
 
-    if (tvec.size() == 1 && tvec[0].element_of() == op->dtype.element_of() &&
-        tvec[0].lanes() % op->dtype.lanes() == 0 && tvec[0].lanes() != op->dtype.lanes()) {
-      int factor = tvec[0].lanes() / op->dtype.lanes();
-      Array<PrimExpr> extents = op->extents;
-      arith::ModularSet me = analyzer_.modular_set(extents[extents.size() - 1]);
-      if (me->base % factor == 0 && me->coeff % factor == 0) {
-        extents.Set(extents.size() - 1,
-                    extents[extents.size() - 1] / make_const(extents[0].dtype(), factor));
-        // create a new buffer var
-        DataType new_dtype = tvec[0];
-        Var new_buffer_var(op->buffer_var->name_hint, PointerType(PrimType(new_dtype)));
-        // update the remap req.
-        var_remap_.Set(op->buffer_var, new_buffer_var);
-        return Allocate(new_buffer_var, new_dtype, extents, op->condition, op->body);
+    auto it = rewrite_map_.find(op->buffer_var.get());
+    if (it == rewrite_map_.end()) {
+      return stmt;
+    }
+
+    const auto& info = it->second;
+
+    Var new_buffer_var = info.new_buffer_var;
+
+    Array<PrimExpr> extents = op->extents;
+    PrimExpr last_extent = extents[extents.size() - 1];
+    extents.Set(extents.size() - 1, last_extent / make_const(last_extent.dtype(), info.factor()));
+    return Allocate(new_buffer_var, info.new_element_dtype, extents, op->condition, op->body);
+  }
+
+  Stmt VisitStmt_(const AllocateConstNode* op) final {
+    Stmt stmt = StmtExprMutator::VisitStmt_(op);
+    op = stmt.as<AllocateConstNode>();
+
+    auto it = rewrite_map_.find(op->buffer_var.get());
+    if (it == rewrite_map_.end()) {
+      return stmt;
+    }
+
+    const auto& info = it->second;
+
+    Var new_buffer_var = info.new_buffer_var;
+
+    int factor = info.new_element_dtype.lanes() / op->dtype.lanes();
+
+    Array<PrimExpr> extents = op->extents;
+    extents.Set(extents.size() - 1,
+                extents[extents.size() - 1] / make_const(extents[0].dtype(), factor));
+    return AllocateConst(new_buffer_var, info.new_element_dtype, extents, op->data, op->body);
+  }
+
+  /* Update the parameters and all remaining variable references
+   *
+   * Should be called after calling operator() on the body of the
+   * function.
+   *
+   * @param func A pointer to the PrimFunc being modified.
+   */
+  void Finalize(PrimFunc* func_ptr) {
+    ICHECK(func_ptr) << "Finalize expects a non-null pointer";
+    auto& func = *func_ptr;
+    auto* n = func.CopyOnWrite();
+
+    // Remap any remaining references to the old buffer variables
+    Map<Var, PrimExpr> var_remap;
+    for (const auto& pair : rewrite_map_) {
+      const auto& info = pair.second;
+      var_remap.Set(info.old_buffer_var, info.new_buffer_var);
+    }
+    n->body = Substitute(n->body, var_remap);
+
+    // Remap the argument list to use the new buffer variables.
+    Array<Var> new_params;
+    for (const auto& old_param : n->params) {
+      auto it = rewrite_map_.find(old_param.get());
+      if (it == rewrite_map_.end()) {
+        new_params.push_back(old_param);
+      } else {
+        const auto& info = it->second;
+        new_params.push_back(info.new_buffer_var);
       }
     }
-    return stmt;
-  }
+    n->params = new_params;
 
-  void UpdateTypeMap(const VarNode* buffer, DataType t) {
-    auto& tvec = acc_map_[buffer];
-    if (std::find(tvec.begin(), tvec.end(), t) == tvec.end()) {
-      tvec.push_back(t);
+    // Remap the Buffer objects in PrimFunc::buffer_map so that the
+    // buffers use the new buffer variables
+    Map<Var, Buffer> new_buffer_map;
+    for (const auto& pair : n->buffer_map) {
+      Var key = pair.first;
+      Buffer old_buffer = pair.second;
+      Var old_var = old_buffer->data;
+      Buffer new_buffer = RemapBuffer(old_buffer);
+      new_buffer_map.Set(key, new_buffer);
     }
+    n->buffer_map = new_buffer_map;
   }
 
-  // Internal access map
-  std::unordered_map<const VarNode*, std::vector<DataType> > acc_map_;
-  // Variables to remap
-  Map<tir::Var, PrimExpr> var_remap_;
-  // internal analyzer
-  arith::Analyzer analyzer_;
+ private:
+  struct RewriteInfo {
+    Var old_buffer_var;
+    Var new_buffer_var;
+    DataType old_element_dtype;
+    DataType new_element_dtype;
+
+    int factor() const {
+      int old_lanes = old_element_dtype.lanes();
+      int new_lanes = new_element_dtype.lanes();
+      ICHECK_EQ(new_lanes % old_lanes, 0);
+      return new_lanes / old_lanes;
+    }
+  };
+
+  bool rewrite_indices_{true};
+  std::unordered_map<const VarNode*, RewriteInfo> rewrite_map_;
+  std::unordered_map<const BufferNode*, Buffer> buffer_map_;
 };
 
-PrimFunc PointerValueTypeRewrite(PrimFunc f) {
-  auto* n = f.CopyOnWrite();
-  VectorAllocRewriter rewriter;
+// Rewrite allocates, pointer parameters, and buffer map into vectorized versions
+// if each access into a buffer is the same vector type.
+PrimFunc PointerValueTypeRewrite(PrimFunc f, bool allow_untyped_pointers = false,
+                                 bool rewrite_params = true, bool rewrite_buffer_map = true,
+                                 bool rewrite_allocate_node = true, bool rewrite_indices = true,
+                                 bool rewrite_let_node = true,
+                                 bool rewrite_allocate_const_node = true) {
+  VectorTypeAccessChecker checker(f->params, f->buffer_map, allow_untyped_pointers);
+  checker(f->body);
+
+  VectorTypeRewriter rewriter(checker.info_map_, rewrite_params, rewrite_buffer_map,
+                              rewrite_allocate_node, rewrite_indices, rewrite_let_node,
+                              rewrite_allocate_const_node);
+  PrimFuncNode* n = f.CopyOnWrite();
   n->body = rewriter(std::move(n->body));
+  rewriter.Finalize(&f);
 
-  Map<tir::Var, PrimExpr> var_remap = std::move(rewriter.var_remap_);
-  Array<tir::Var> args;
-
-  // rewrite paramters if needed.
-  for (Var var : f->params) {
-    if (var.dtype().is_handle()) {
-      const auto& tvec = rewriter.acc_map_[var.get()];
-
-      if (tvec.size() == 1) {
-        tir::Var new_var(var->name_hint, PointerType(PrimType(tvec[0])));
-        args.push_back(new_var);
-        var_remap.Set(var, new_var);
-      } else {
-        // always set data type to be non vectorized so
-        // load/store can still work via scalarization
-        if (tvec.size() != 0 && !var->type_annotation.defined()) {
-          tir::Var new_var(var->name_hint, PointerType(PrimType(tvec[0].with_lanes(1))));
-          args.push_back(new_var);
-          var_remap.Set(var, new_var);
-        } else {
-          args.push_back(var);
-        }
-      }
-    } else {
-      args.push_back(var);
-    }
-  }
-
-  // no variable remap is needed.
-  if (var_remap.size() == 0) return f;
-
-  // remap the variables.
-  ICHECK_EQ(args.size(), n->params.size());
-  n->params = args;
-  n->body = Substitute(n->body, var_remap);
   return f;
 }
 
@@ -1006,7 +1645,13 @@ Pass StorageRewrite() {
   auto pass_func = [](PrimFunc f, IRModule m, PassContext ctx) {
     auto* n = f.CopyOnWrite();
     n->body = StoragePlanRewriter().Rewrite(std::move(n->body), true);
-    return PointerValueTypeRewrite(std::move(f));
+    // Parameters may not be rewritten, but internal allocations may.
+    // Vectorization of AllocateConst is currently disabled, as it has
+    // indexing issues for types that include padding (e.g. int8x3
+    // padded out to 32 bits) would require either rewriting
+    // AllocateConst::data, or would require the code generators to
+    // handle vectorized constants.
+    return PointerValueTypeRewrite(std::move(f), true, false, false, true, true, true, false);
   };
   return CreatePrimFuncPass(pass_func, 0, "tir.StorageRewrite", {});
 }

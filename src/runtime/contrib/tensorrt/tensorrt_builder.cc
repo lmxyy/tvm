@@ -40,7 +40,7 @@ namespace contrib {
 TensorRTBuilder::TensorRTBuilder(TensorRTLogger* logger,
                                  const std::vector<const DLTensor*>& data_entry,
                                  size_t max_workspace_size, bool use_implicit_batch, bool use_fp16,
-                                 int batch_size)
+                                 int batch_size, nvinfer1::IInt8Calibrator* calibrator)
     : data_entry_(data_entry),
       max_workspace_size_(max_workspace_size),
       use_implicit_batch_(use_implicit_batch),
@@ -48,6 +48,8 @@ TensorRTBuilder::TensorRTBuilder(TensorRTLogger* logger,
       batch_size_(batch_size) {
   // Create TRT builder and network.
   builder_ = nvinfer1::createInferBuilder(*logger);
+  use_int8_ = false;
+
 #if TRT_VERSION_GE(6, 0, 1)
   // Use INetworkV2.
   auto flags =
@@ -56,9 +58,12 @@ TensorRTBuilder::TensorRTBuilder(TensorRTLogger* logger,
     flags = 0U;
     builder_->setMaxBatchSize(batch_size_);
   }
+  this->calibrator_ = calibrator;
+  if (calibrator != nullptr) {
+    use_int8_ = true;
+  }
   network_ = builder_->createNetworkV2(flags);
 #else
-  // Use INetwork with implicit batch.
   builder_->setMaxBatchSize(batch_size_);
   builder_->setMaxWorkspaceSize(max_workspace_size_);
   builder_->setFp16Mode(use_fp16_);
@@ -80,8 +85,13 @@ void TensorRTBuilder::AddInput(int nid, uint32_t entry_id, const JSONGraphNode& 
       shape.erase(shape.begin());
     }
     nvinfer1::Dims dims = VectorToTrtDims(shape);
-    ICHECK(TypeMatch(dtypes[i], kDLFloat, 32)) << "Only FP32 inputs are supported.";
-    auto input_tensor = network_->addInput(name.c_str(), nvinfer1::DataType::kFLOAT, dims);
+    ICHECK((dtypes[i].bits != 16 || dtypes[i].bits != 32))
+        << "Invalid input Tensor type. Float16 and Float32 are supported";
+
+    auto tensor_dtype =
+        (dtypes[i].bits == 16) ? nvinfer1::DataType::kHALF : nvinfer1::DataType::kFLOAT;
+
+    auto input_tensor = network_->addInput(name.c_str(), tensor_dtype, dims);
     node_output_map_[nid].push_back(TensorRTOpInput(input_tensor));
     network_input_names_.push_back(name);
     entry_id_map_[name] = entry_id + i;
@@ -136,8 +146,6 @@ void TensorRTBuilder::AddLayer(int nid, const JSONGraphNode& node) {
     }
     params.inputs.push_back(input);
   }
-  ICHECK(converter->variable_input_count || converter->input_types.size() == params.inputs.size())
-      << "Op expected a different number of inputs.";
 
   // Convert op to TRT.
   converter->Convert(&params);
@@ -145,6 +153,11 @@ void TensorRTBuilder::AddLayer(int nid, const JSONGraphNode& node) {
   // Get outputs.
   node_output_map_[nid] = {};
   for (auto out : params.outputs) {
+    auto out_type = params.inputs.at(1).weight.type == params.inputs.at(0).tensor->getType()
+                        ? params.inputs.at(0).tensor->getType()
+                        : params.inputs.at(1).weight.type;
+    out->setType(out_type);
+
     node_output_map_[nid].push_back(TensorRTOpInput(out));
   }
 }
@@ -158,15 +171,31 @@ TensorRTEngineAndContext TensorRTBuilder::BuildEngine() {
   if (use_fp16_) {
     config_->setFlag(nvinfer1::BuilderFlag::kFP16);
   }
+
+  if (use_int8_) {
+    config_->setFlag(nvinfer1::BuilderFlag::kINT8);
+    config_->setInt8Calibrator(calibrator_);
+    LOG(INFO) << "config finishes setting up calibrator as INT8 mode ... ";
+  }
+
   // Add profiles.
   if (!use_implicit_batch_) {
     auto profile = builder_->createOptimizationProfile();
     for (int i = 0; i < network_->getNbInputs(); ++i) {
       auto name = network_->getInput(i)->getName();
-      auto dims = network_->getInput(i)->getDimensions();
-      profile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, dims);
+      const uint32_t entry_id = entry_id_map_[name];
+      std::vector<int64_t> shape(data_entry_[entry_id]->shape,
+                                 data_entry_[entry_id]->shape + data_entry_[entry_id]->ndim);
+      auto dims = VectorToTrtDims(shape);
+
       profile->setDimensions(name, nvinfer1::OptProfileSelector::kOPT, dims);
       profile->setDimensions(name, nvinfer1::OptProfileSelector::kMAX, dims);
+      // Set minimum batch size to 1 when dynamic batching is used.
+      if (network_->getInput(i)->getDimensions().nbDims >= 1 &&
+          network_->getInput(i)->getDimensions().d[0] == -1) {
+        dims.d[0] = 1;
+      }
+      profile->setDimensions(name, nvinfer1::OptProfileSelector::kMIN, dims);
     }
     config_->addOptimizationProfile(profile);
   }
@@ -184,18 +213,17 @@ TensorRTEngineAndContext TensorRTBuilder::BuildEngine() {
 nvinfer1::Weights TensorRTBuilder::GetDLTensorAsWeights(const DLTensor* dptr,
                                                         DLDeviceType src_device) {
   ICHECK_EQ(dptr->device.device_type, src_device);
-  ICHECK(static_cast<int>(dptr->dtype.code) == kDLFloat ||
-         static_cast<int>(dptr->dtype.code) == kDLInt);
-  const auto trt_dtype = static_cast<int>(dptr->dtype.code) == kDLFloat
-                             ? nvinfer1::DataType::kFLOAT
-                             : nvinfer1::DataType::kINT32;
+  ICHECK((dptr->dtype.bits != 16 || dptr->dtype.bits != 32))
+      << "Invalid input Tensor type. Float16 and Float32 are supported";
+  const auto trt_dtype = (static_cast<int>(dptr->dtype.bits) == 16) ? nvinfer1::DataType::kHALF
+                                                                    : nvinfer1::DataType::kFLOAT;
+
   const size_t weight_bytes = GetDataSize(*dptr);
   nvinfer1::Weights weight{trt_dtype, nullptr, 0};
   size_t count = 1;
   for (tvm_index_t i = 0; i < dptr->ndim; ++i) {
     count *= dptr->shape[i];
   }
-  ICHECK_EQ(count * 4, weight_bytes);
   weight.count = count;
   weight.values = new float[count];
   ICHECK_EQ(TVMArrayCopyToBytes(const_cast<DLTensor*>(dptr), const_cast<void*>(weight.values),
@@ -229,7 +257,7 @@ void TensorRTBuilder::CleanUp() {
 #endif
   builder_->destroy();
   for (auto weight : trt_weights_) {
-    if (weight.type == nvinfer1::DataType::kFLOAT) {
+    if (weight.type == nvinfer1::DataType::kFLOAT || weight.type == nvinfer1::DataType::kHALF) {
       delete[] static_cast<const float*>(weight.values);
     } else {
       delete[] static_cast<const uint16_t*>(weight.values);

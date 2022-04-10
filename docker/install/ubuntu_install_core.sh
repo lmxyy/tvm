@@ -22,9 +22,46 @@ set -o pipefail
 
 # install libraries for building c++ core on ubuntu
 apt-get update && apt-get install -y --no-install-recommends \
-        git make libgtest-dev cmake wget unzip libtinfo-dev libz-dev\
-        libcurl4-openssl-dev libssl-dev libopenblas-dev g++ sudo \
-        apt-transport-https graphviz pkg-config curl
+    apt-transport-https \
+    cmake \
+    curl \
+    g++ \
+    gdb \
+    git \
+    google-mock \
+    graphviz \
+    libcurl4-openssl-dev \
+    libgtest-dev \
+    libopenblas-dev \
+    libssl-dev \
+    libtinfo-dev \
+    libz-dev \
+    lsb-core \
+    make \
+    ninja-build \
+    parallel \
+    pkg-config \
+    sudo \
+    unzip \
+    wget \
 
 
-cd /usr/src/gtest && cmake CMakeLists.txt && make && cp *.a /usr/lib
+# Get Ubuntu version
+release=$(lsb_release -r)
+version_number=$(cut -f2 <<< "$release")
+
+if [ "$version_number" == "20.04" ]; then
+  # Single package source (Ubuntu 20.04)
+  # googletest is installed via libgtest-dev
+  cd /usr/src/googletest && cmake CMakeLists.txt && make && cp -v lib/*.a /usr/lib
+  cd /usr/src/gmock && make install
+elif [ "$version_number" == "18.04" ]; then
+  # Single package source (Ubuntu 18.04)
+  # googletest is installed via libgtest-dev
+  cd /usr/src/googletest && cmake CMakeLists.txt && make && cp -v {googlemock,googlemock/gtest}/*.a /usr/lib
+else
+  # Split source package (Ubuntu 16.04)
+  # libgtest-dev and google-mock
+  cd /usr/src/gtest && cmake CMakeLists.txt && make && cp -v *.a /usr/lib
+  cd /usr/src/gmock && cmake CMakeLists.txt && make && cp -v *.a /usr/lib
+fi

@@ -43,6 +43,13 @@ class LCADetector : public StmtExprVisitor {
       detector.buffer_var_map_.emplace(buffer->data.get(), buffer.get());
     }
 
+    // The root node must be explicitly present in the list of
+    // ancestor_scopes_.  We cannot use nullptr to represent the root
+    // node, as that is also used to represent a scope that hasn't
+    // been observed before.
+    ScopeInfo root(nullptr, nullptr, 0);
+    detector.ancestor_scopes_.push_back(&root);
+
     detector(func->body);
     // Prepare the return
     Map<Buffer, Optional<Stmt>> buffer_lca;
@@ -85,9 +92,17 @@ class LCADetector : public StmtExprVisitor {
     for (const Buffer& buf : op->alloc_buffers) {
       buffer_var_map_.emplace(buf->data.get(), buf.get());
     }
+
     const ScopeInfo* parent_scope = ancestor_scopes_.back();
     auto* current_scope = arena_.make<ScopeInfo>(parent_scope, op, n);
+
     ancestor_scopes_.push_back(current_scope);
+    // Update match_buffers
+    for (const MatchBufferRegion& match_buffer : op->match_buffers) {
+      UpdateBufferLCA(match_buffer->source->buffer.get());
+      match_buffers_.insert(match_buffer->buffer.get());
+    }
+
     StmtExprVisitor::VisitStmt_(op);
     ancestor_scopes_.pop_back();
   }
@@ -112,13 +127,11 @@ class LCADetector : public StmtExprVisitor {
 
   // Explict to visit buffer data in Load and Store node.
   void VisitExpr_(const LoadNode* op) final {
-    ExprVisitor::VisitExpr_(op);
-    VisitBufferVar(op->buffer_var.get());
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
   }
 
   void VisitStmt_(const StoreNode* op) final {
-    StmtVisitor::VisitStmt_(op);
-    VisitBufferVar(op->buffer_var.get());
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
   }
 
   void VisitBufferVar(const VarNode* op) {
@@ -129,8 +142,12 @@ class LCADetector : public StmtExprVisitor {
   }
 
   void UpdateBufferLCA(const BufferNode* buffer) {
-    const ScopeInfo*& lca = buffer_lca_[buffer];
-    lca = LowestCommonAncestor(lca, ancestor_scopes_.back());
+    buffer_var_map_.emplace(buffer->data.get(), buffer);
+    if (match_buffers_.find(buffer) == match_buffers_.end()) {
+      // Ingore buffer created by block match_buffer
+      const ScopeInfo*& lca = buffer_lca_[buffer];
+      lca = LowestCommonAncestor(lca, ancestor_scopes_.back());
+    }
   }
 
   static const ScopeInfo* LowestCommonAncestor(const ScopeInfo* lhs, const ScopeInfo* rhs) {
@@ -158,12 +175,17 @@ class LCADetector : public StmtExprVisitor {
     return lhs;
   }
 
-  /*! \brief The ancestor scope stacks info (Block and For), initialized with Null. */
-  std::vector<const ScopeInfo*> ancestor_scopes_ = {nullptr};
+  /*! \brief The ancestor scope stacks info (Block and For).  The
+   *  first element is initialized in LCADetector::Detect to represent
+   *  the root scope.
+   */
+  std::vector<const ScopeInfo*> ancestor_scopes_ = {};
   /*! \brief The map from Buffer to its LCA ForNode/BlockNode. */
   std::unordered_map<const BufferNode*, const ScopeInfo*> buffer_lca_ = {};
   /*! \brief The map from Buffer data to the Buffer. */
   std::unordered_map<const VarNode*, const BufferNode*> buffer_var_map_ = {};
+  /*! \brief The match buffers inside blocks. */
+  std::unordered_set<const BufferNode*> match_buffers_ = {};
   /*! \brief Internal arena. */
   support::Arena arena_;
 };

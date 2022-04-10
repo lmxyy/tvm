@@ -132,6 +132,8 @@ VulkanDeviceProperties::VulkanDeviceProperties(const VulkanInstance& instance,
       device.HasExtension("VK_KHR_dedicated_allocation") &&
       !support::BoolEnvironmentVar("TVM_VULKAN_DISABLE_DEDICATED_ALLOCATION");
 
+  supports_integer_dot_product = device.HasExtension("VK_KHR_shader_integer_dot_product");
+
   // The check of VK_SHADER_STAGE_COMPUTE_BIT isn't technically
   // needed, since it will be set so long at least one queue has
   // VK_QUEUE_COMPUTE_BIT.  Including it to avoid potential future
@@ -155,6 +157,31 @@ VulkanDeviceProperties::VulkanDeviceProperties(const VulkanInstance& instance,
   max_shared_memory_per_block = properties.properties.limits.maxComputeSharedMemorySize;
   device_name = properties.properties.deviceName;
   driver_version = properties.properties.driverVersion;
+
+  if (device.HasExtension("VK_KHR_driver_properties")) {
+    driver_name = driver.driverName;
+  }
+
+  switch (properties.properties.deviceType) {
+    case VK_PHYSICAL_DEVICE_TYPE_OTHER:
+      device_type = "other";
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_INTEGRATED_GPU:
+      device_type = "integrated";
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_DISCRETE_GPU:
+      device_type = "discrete";
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_VIRTUAL_GPU:
+      device_type = "virtual";
+      break;
+    case VK_PHYSICAL_DEVICE_TYPE_CPU:
+      device_type = "cpu";
+      break;
+    default:
+      LOG(FATAL) << "Unknown vulkan device type: " << properties.properties.deviceType;
+      break;
+  }
 
   // By default, use the maximum API version that the driver allows,
   // so that any supported features can be used by TVM shaders.
@@ -385,18 +412,17 @@ uint32_t VulkanDevice::SelectComputeQueueFamily() const {
 
 std::vector<const char*> VulkanDevice::SelectEnabledExtensions() const {
   std::vector<const char*> required_extensions{};
-  std::vector<const char*> optional_extensions{
-      "VK_KHR_driver_properties",
-      "VK_KHR_storage_buffer_storage_class",
-      "VK_KHR_8bit_storage",
-      "VK_KHR_16bit_storage",
-      "VK_KHR_shader_float16_int8",
-      "VK_KHR_push_descriptor",
-      "VK_KHR_descriptor_update_template",
-      "VK_KHR_get_memory_requirements2",
-      "VK_KHR_dedicated_allocation",
-      "VK_KHR_spirv_1_4",
-  };
+  std::vector<const char*> optional_extensions{"VK_KHR_driver_properties",
+                                               "VK_KHR_storage_buffer_storage_class",
+                                               "VK_KHR_8bit_storage",
+                                               "VK_KHR_16bit_storage",
+                                               "VK_KHR_shader_float16_int8",
+                                               "VK_KHR_push_descriptor",
+                                               "VK_KHR_descriptor_update_template",
+                                               "VK_KHR_get_memory_requirements2",
+                                               "VK_KHR_dedicated_allocation",
+                                               "VK_KHR_spirv_1_4",
+                                               "VK_KHR_shader_integer_dot_product"};
 
   uint32_t device_extension_prop_count;
   VULKAN_CALL(vkEnumerateDeviceExtensionProperties(physical_device_, nullptr,

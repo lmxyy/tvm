@@ -30,6 +30,9 @@
 #include <tvm/tir/stmt.h>
 #include <tvm/tir/stmt_functor.h>
 
+#include "../../runtime/thread_storage_scope.h"
+#include "../transforms/ir_utils.h"
+
 namespace tvm {
 namespace tir {
 
@@ -38,7 +41,7 @@ class GPUCodeVerifier : public StmtExprVisitor {
   std::vector<String> Verify(Stmt stmt, int64_t max_local_memory_per_block,
                              int64_t max_shared_memory_per_block, int64_t max_threads_per_block,
                              int64_t max_thread_x, int64_t max_thread_y, int64_t max_thread_z,
-                             int64_t max_vthread, int64_t max_vector_bytes) {
+                             int64_t max_vthread, int64_t max_vector_bytes, int64_t max_kernels) {
     max_local_memory_per_block_ = static_cast<size_t>(max_local_memory_per_block);
     max_shared_memory_per_block_ = static_cast<size_t>(max_shared_memory_per_block);
     max_threads_per_block_ = static_cast<size_t>(max_threads_per_block);
@@ -47,7 +50,7 @@ class GPUCodeVerifier : public StmtExprVisitor {
     max_thread_z_ = static_cast<size_t>(max_thread_z);
     max_vthread_ = static_cast<size_t>(max_vthread);
     max_vector_bytes_ = static_cast<size_t>(max_vector_bytes);
-
+    max_kernels_ = static_cast<size_t>(max_kernels);
     Reset_();
 
     // TODO(jcf94): Add support of detecting CUDA Misaligned Address error
@@ -58,12 +61,14 @@ class GPUCodeVerifier : public StmtExprVisitor {
 
   void VisitStmt_(const AllocateNode* op) final {
     StmtVisitor::VisitStmt_(op);
+    auto scope = GetPtrStorageScope(op->buffer_var);
+    runtime::StorageScope storage_scope = runtime::StorageScope::Create(scope);
     // visit an allocation of a buffer in shared memory, record its size
-    if (visited_local_buffers_.count(op->buffer_var.get()) != 0) {
-      size_t size = static_cast<size_t>(op->constant_allocation_size());
+    if (storage_scope.rank == runtime::StorageRank::kLocal) {
+      size_t size = static_cast<size_t>(op->ConstantAllocationSize());
       local_memory_per_block_ += size * op->dtype.bytes() * op->dtype.lanes();
-    } else if (visited_shared_buffers_.count(op->buffer_var.get()) != 0) {
-      size_t size = static_cast<size_t>(op->constant_allocation_size());
+    } else if (storage_scope.rank == runtime::StorageRank::kShared) {
+      size_t size = static_cast<size_t>(op->ConstantAllocationSize());
       shared_memory_per_block_ += size * op->dtype.bytes() * op->dtype.lanes();
     }
     if (op->dtype.lanes() > 1) {
@@ -78,18 +83,11 @@ class GPUCodeVerifier : public StmtExprVisitor {
   }
 
   void VisitStmt_(const AttrStmtNode* op) final {
-    if (op->attr_key == attr::storage_scope) {
-      std::string op_value = op->value.as<StringImmNode>()->value;
-      if (op_value == "local") {
-        visited_local_buffers_.insert(op->node.as<VarNode>());
-      } else if (op_value == "shared") {
-        visited_shared_buffers_.insert(op->node.as<VarNode>());
-      }
-      StmtVisitor::VisitStmt_(op);
-    } else if (op->attr_key == attr::thread_extent || op->attr_key == attr::virtual_thread) {
+    if (op->attr_key == attr::thread_extent || op->attr_key == attr::virtual_thread) {
       if (nest_level_ == 0) {
         // enter a new kernel, reset statistics
         Reset_();
+        kernels_launched_++;
       }
 
       Var var = op->node.as<IterVarNode>()->var;
@@ -158,6 +156,13 @@ class GPUCodeVerifier : public StmtExprVisitor {
         err("threads per block", thread_per_block_, max_threads_per_block_);
         err("local memory per block", local_memory_per_block_, max_local_memory_per_block_);
         err("shared memory per block", shared_memory_per_block_, max_shared_memory_per_block_);
+
+        if (kernels_launched_ > max_kernels_) {
+          std::stringstream s;
+          s << "Number of launched kernels (" << kernels_launched_
+            << ") is greater than the allowed maximum (" << max_kernels_ << ")";
+          errors_.push_back(s.str());
+        }
       }
     } else {
       StmtVisitor::VisitStmt_(op);
@@ -181,7 +186,15 @@ class GPUCodeVerifier : public StmtExprVisitor {
     StmtVisitor::VisitStmt_(op);
   }
 
-  void VisitExpr_(const LoadNode* op) {
+  void VisitExpr_(const LoadNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+  }
+
+  void VisitStmt_(const StoreNode* op) final {
+    LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+  }
+
+  void VisitExpr_(const BufferLoadNode* op) {
     if (op->dtype.lanes() > 1) {
       if (static_cast<size_t>(op->dtype.lanes() * op->dtype.bytes()) > max_vector_bytes_) {
         std::stringstream s;
@@ -194,13 +207,13 @@ class GPUCodeVerifier : public StmtExprVisitor {
     ExprVisitor::VisitExpr_(op);
   }
 
-  void VisitStmt_(const StoreNode* op) {
-    if (op->index->dtype.lanes() > 1) {
-      if (static_cast<size_t>(op->index->dtype.lanes() * op->index->dtype.bytes()) >
+  void VisitStmt_(const BufferStoreNode* op) {
+    if (op->value->dtype.lanes() > 1) {
+      if (static_cast<size_t>(op->value->dtype.lanes() * op->value->dtype.bytes()) >
           max_vector_bytes_) {
         std::stringstream s;
-        s << "Number of lanes (" << op->index->dtype.lanes() << ") times number of bytes ("
-          << op->index->dtype.bytes() << ") for dtype " << op->index->dtype
+        s << "Number of lanes (" << op->value->dtype.lanes() << ") times number of bytes ("
+          << op->value->dtype.bytes() << ") for dtype " << op->value->dtype
           << " is greater than the maximum number of vector bytes (" << max_vector_bytes_ << ")";
         errors_.push_back(s.str());
       }
@@ -211,8 +224,6 @@ class GPUCodeVerifier : public StmtExprVisitor {
  private:
   int nest_level_{0};
 
-  std::unordered_set<const VarNode*> visited_local_buffers_;
-  std::unordered_set<const VarNode*> visited_shared_buffers_;
   std::unordered_set<std::string> visited_threads_;
 
   size_t thread_x_extent_, thread_y_extent_, thread_z_extent_;
@@ -220,18 +231,18 @@ class GPUCodeVerifier : public StmtExprVisitor {
   size_t local_memory_per_block_;
   size_t shared_memory_per_block_;
   size_t thread_per_block_;
+  size_t kernels_launched_{0};
 
   size_t max_local_memory_per_block_;
   size_t max_shared_memory_per_block_;
   size_t max_threads_per_block_;
   size_t max_thread_x_, max_thread_y_, max_thread_z_, max_vthread_;
   size_t max_vector_bytes_;
+  size_t max_kernels_;
 
   std::vector<String> errors_;
 
   void Reset_() {
-    visited_local_buffers_.clear();
-    visited_shared_buffers_.clear();
     local_memory_per_block_ = 0;
     shared_memory_per_block_ = 0;
 
@@ -251,6 +262,7 @@ std::vector<String> VerifyGPUCode_(const PrimFunc& func, Map<String, PrimExpr> c
   int64_t max_thread_z = INT64_MAX;
   int64_t max_vthread = INT64_MAX;
   int64_t max_vector_bytes = INT64_MAX;
+  int64_t max_kernels = INT64_MAX;
 
   for (auto iter : constraints) {
     const IntImmNode* val = iter.second.as<IntImmNode>();
@@ -270,6 +282,8 @@ std::vector<String> VerifyGPUCode_(const PrimFunc& func, Map<String, PrimExpr> c
       max_vthread = val->value;
     } else if (iter.first == "max_vector_bytes") {
       max_vector_bytes = val->value;
+    } else if (iter.first == "max_kernels") {
+      max_kernels = val->value;
     } else {
       LOG(FATAL) << "Invalid check item: " << iter.first;
     }
@@ -277,7 +291,7 @@ std::vector<String> VerifyGPUCode_(const PrimFunc& func, Map<String, PrimExpr> c
 
   return verifier.Verify(func->body, max_local_memory_per_block, max_shared_memory_per_block,
                          max_threads_per_block, max_thread_x, max_thread_y, max_thread_z,
-                         max_vthread, max_vector_bytes);
+                         max_vthread, max_vector_bytes, max_kernels);
 }
 
 bool VerifyGPUCode(const PrimFunc& func, Map<String, PrimExpr> constraints) {

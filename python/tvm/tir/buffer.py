@@ -90,7 +90,9 @@ class Buffer(Object):
                     raise ValueError("Unknown access_mask %s" % access_mask)
             access_mask = mask
         offset = convert(offset)
-        return _ffi_api.BufferAccessPtr(self, access_mask, ptr_type, content_lanes, offset)
+        return _ffi_api.BufferAccessPtr(
+            self, access_mask, ptr_type, content_lanes, offset  # type: ignore
+        )
 
     def vload(self, begin, dtype=None):
         """Generate an Expr that loads dtype from begin index.
@@ -111,7 +113,7 @@ class Buffer(Object):
         """
         begin = (begin,) if isinstance(begin, (int, PrimExpr)) else begin
         dtype = dtype if dtype else self.dtype
-        return _ffi_api.BufferVLoad(self, begin, dtype)
+        return _ffi_api.BufferVLoad(self, begin, dtype)  # type: ignore
 
     def vstore(self, begin, value):
         """Generate a Stmt that store value into begin index.
@@ -130,7 +132,43 @@ class Buffer(Object):
             The corresponding store stmt.
         """
         begin = (begin,) if isinstance(begin, (int, PrimExpr)) else begin
-        return _ffi_api.BufferVStore(self, begin, value)
+        return _ffi_api.BufferVStore(self, begin, value)  # type: ignore
+
+    def scope(self):
+        """Return the storage scope associated with this buffer.
+        Returns
+        -------
+        scope : str
+            The storage scope associated with this buffer.
+        """
+        return _ffi_api.BufferStorageScope(self)  # type: ignore
+
+    def get_flattened_buffer(self):
+        """Generate a Buffer that is a flattened version of this buffer.
+
+        Returns
+        -------
+        flattened : Buffer
+            The corresponding flat buffer.
+        """
+        return _ffi_api.BufferGetFlattenedBuffer(self)  # type: ignore
+
+    def offset_of(self, indices):
+        """Determine the offset of the provided indices in the flattened buffer.
+
+        Parameters
+        ----------
+        indices : Union[PrimExpr, List[PrimExpr]]
+
+            The indices of the element in the original buffer.
+
+        Returns
+        -------
+        flattened_indices: List[PrimExpr]
+
+            The offset indices of the element in the flattened buffer.
+        """
+        return _ffi_api.BufferOffsetOf(self, indices)  # type: ignore
 
 
 def decl_buffer(
@@ -144,6 +182,7 @@ def decl_buffer(
     data_alignment=-1,
     offset_factor=0,
     buffer_type="",
+    axis_separators=None,
     span=None,
 ):
     """Declare a new symbolic buffer.
@@ -192,6 +231,11 @@ def decl_buffer(
         auto_broadcast buffer allows one to implement broadcast computation
         without considering whether dimension size equals to one.
         TVM maps buffer[i][j][k] -> buffer[i][0][k] if dimension j's shape equals 1.
+
+    axis_separators : list of int, optional
+        If passed, a list of separators between groups of axes,
+        each of which is flattened to an output axis.  For flat
+        memory spaces, should either be None, or an empty list.
 
     span: Optional[Span]
         The location of the decl_buffer creation in the source.
@@ -243,25 +287,29 @@ def decl_buffer(
     shape = (shape,) if isinstance(shape, (PrimExpr, Integral)) else shape
     dtype = "float32" if dtype is None else dtype
     strides = () if strides is None else strides
+
+    if axis_separators is None:
+        axis_separators = []
+
     if offset_factor != 0 and elem_offset is None:
-        shape_dtype = shape[0].dtype if hasattr(shape[0], "dtype") else "int32"
+        shape_dtype = shape[0].dtype if shape and hasattr(shape[0], "dtype") else "int32"
         elem_offset = Var("%s_elem_offset" % name, shape_dtype)
     if data is None:
         # Bool is represented as uint1 in the IR, but stored as int8
         storage_type = PrimType(dtype)
         storage_type = PrimType("int8") if storage_type.dtype == "bool" else storage_type
-        data = Var(name, PointerType(storage_type), span)
-    return _ffi_api.Buffer(
+        data = Var(name, PointerType(storage_type, scope), span)
+    return _ffi_api.Buffer(  # type: ignore
         data,
         dtype,
         shape,
         strides,
         elem_offset,
         name,
-        scope,
         data_alignment,
         offset_factor,
         buffer_type,
+        axis_separators,
         span,
     )
 

@@ -81,6 +81,7 @@ struct VulkanDeviceProperties {
   bool supports_storage_buffer_storage_class{false};
   bool supports_push_descriptor{false};
   bool supports_dedicated_allocation{false};
+  bool supports_integer_dot_product{false};
   uint32_t supported_subgroup_operations{0};
   uint32_t max_num_threads{1};
   uint32_t thread_warp_size{1};
@@ -92,7 +93,9 @@ struct VulkanDeviceProperties {
   uint32_t max_storage_buffer_range{1 << 27};
   uint32_t max_per_stage_descriptor_storage_buffer{4};
   uint32_t max_shared_memory_per_block{16384};
-  std::string device_name{"unknown device name"};
+  std::string device_type{"unknown_device_type"};
+  std::string device_name{"unknown_device_name"};
+  std::string driver_name{"unknown_driver_name"};
   uint32_t driver_version{0};
   uint32_t vulkan_api_version{VK_API_VERSION_1_0};
   uint32_t max_spirv_version{0x10000};

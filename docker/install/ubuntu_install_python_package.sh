@@ -21,4 +21,25 @@ set -u
 set -o pipefail
 
 # install libraries for python package on ubuntu
-pip3 install six numpy pytest cython decorator scipy tornado pytest pytest-xdist pytest-profiling mypy orderedset attrs requests Pillow packaging cloudpickle synr
+pip3 install --upgrade \
+    attrs \
+    cloudpickle \
+    cython \
+    decorator \
+    mypy \
+    numpy~=1.19.5 \
+    orderedset \
+    packaging \
+    Pillow \
+    psutil \
+    pytest \
+    tlcpack-sphinx-addon==0.2.1 \
+    pytest-profiling \
+    pytest-xdist \
+    requests \
+    scipy \
+    Jinja2 \
+    synr==0.6.0 \
+    junitparser==2.4.2 \
+    six \
+    tornado

@@ -30,7 +30,7 @@ def test_double_buffer():
     with ib.for_range(0, n) as i:
         B = ib.allocate("float32", m, name="B", scope="shared")
         with ib.new_scope():
-            ib.scope_attr(B.asobject(), "double_buffer_scope", 1)
+            ib.scope_attr(B.asobject().data, "double_buffer_scope", 1)
             with ib.for_range(0, m) as j:
                 B[j] = A[i * 4 + j]
         with ib.for_range(0, m) as j:
@@ -47,8 +47,8 @@ def test_double_buffer():
         mod = opt(mod)
     stmt = mod["db"].body
 
-    assert isinstance(stmt.body.body, tvm.tir.Allocate)
-    assert stmt.body.body.extents[0].value == 2
+    assert isinstance(stmt.body, tvm.tir.Allocate)
+    assert list(stmt.body.extents) == [m * 2]
 
     f = tvm.tir.transform.ThreadSync("shared")(mod)["db"]
     count = [0]

@@ -77,6 +77,8 @@ void CodeGenLLVM::Init(const std::string& module_name, llvm::TargetMachine* tm,
   this->InitTarget(tm);
 }
 
+void CodeGenLLVM::SetFastMathFlag(llvm::FastMathFlags fmf) { builder_->setFastMathFlags(fmf); }
+
 void CodeGenLLVM::InitTarget(llvm::TargetMachine* tm) {
   module_->setTargetTriple(tm->getTargetTriple().str());
   module_->setDataLayout(tm->createDataLayout());
@@ -146,6 +148,7 @@ void CodeGenLLVM::AddFunctionInternal(const PrimFunc& f, bool ret_void) {
     llvm::Argument* v = &(*arg_it);
     const Var& var = f->params[i];
     var_map_[var.get()] = v;
+    v->setName(std::string(var->name_hint));
     if (is_restricted_) {
       if (var.dtype().is_handle() && !alias_var_set_.count(var.get())) {
         // set non alias.
@@ -343,7 +346,26 @@ void CodeGenLLVM::Optimize() {
 
   // place optimization pass
   llvm::PassManagerBuilder builder;
-  builder.OptLevel = 3;
+
+  // Use the same opt-level as specified in TargetMachine for running passes
+  llvm::CodeGenOpt::Level opt_level = target_machine_->getOptLevel();
+
+  switch (opt_level) {
+    case llvm::CodeGenOpt::Level::None:
+      builder.OptLevel = 0;
+      break;
+    case llvm::CodeGenOpt::Level::Less:
+      builder.OptLevel = 1;
+      break;
+
+    case llvm::CodeGenOpt::Level::Default:
+      builder.OptLevel = 2;
+      break;
+
+    default:
+      // CodeGenOpt::Level::Aggressive
+      builder.OptLevel = 3;
+  }
 
 #if TVM_LLVM_VERSION >= 50
   builder.Inliner = llvm::createFunctionInliningPass(builder.OptLevel, 0, false);
@@ -410,12 +432,19 @@ llvm::Type* CodeGenLLVM::DTypeToLLVMType(const DataType& dtype) const {
   } else {
     return etype;
   }
-}
+}  // namespace codegen
 
 llvm::Type* CodeGenLLVM::GetLLVMType(const Type& type) const {
   if (auto* ptr = type.as<PrimTypeNode>()) {
     return DTypeToLLVMType(ptr->dtype);
   } else if (auto* ptr = type.as<PointerTypeNode>()) {
+    // LLVM IR doesn't allow void*, so we need to recognize this
+    // pattern explicitly.
+    if (auto* primtype = ptr->element_type.as<PrimTypeNode>()) {
+      if (primtype->dtype.is_void()) {
+        return t_void_p_;
+      }
+    }
     // TODO(tvm-team) consider put storage scope into the pointer type.
     return GetLLVMType(ptr->element_type)->getPointerTo(GetGlobalAddressSpace());
   } else if (IsVoidType(type)) {
@@ -473,9 +502,16 @@ void CodeGenLLVM::AddAliasInfo(llvm::Instruction* inst, const VarNode* buffer, P
   meta = md_builder_->createTBAAScalarTypeNode(buffer_addr.str(), meta);
 
   // Extract the underlying type of the allocated buffer.
-  llvm::Type* buf_type = GetVarValue(buffer)->getType()->getScalarType();
-  if (buf_type->isPointerTy()) {
-    buf_type = buf_type->getPointerElementType();
+  DataType dtype = buffer->dtype;
+  if (buffer->type_annotation.defined()) {
+    Type element_type = Downcast<PointerType>(buffer->type_annotation)->element_type;
+    if (auto* ptype = element_type.as<PrimTypeNode>()) {
+      dtype = ptype->dtype;
+    }
+  }
+  llvm::Type* buf_type = DTypeToLLVMType(dtype);
+  if (!buf_type) {
+    buf_type = t_void_p_;
   }
 
   std::string tmp;
@@ -501,7 +537,8 @@ void CodeGenLLVM::GetAlignment(DataType t, const VarNode* buf_var, const PrimExp
   auto it = alloc_storage_info_.find(buf_var);
   if (it != alloc_storage_info_.end()) {
     const StorageInfo& info = it->second;
-    *p_native_bits = NativeVectorBits(info.scope);
+    *p_native_bits =
+        NativeVectorBits(runtime::StorageScope::Create(GetPtrStorageScope(GetRef<Var>(buf_var))));
     max_align_bits = info.alignment * 8;
   } else {
     *p_native_bits = native_vector_bits_;
@@ -521,6 +558,22 @@ void CodeGenLLVM::GetAlignment(DataType t, const VarNode* buf_var, const PrimExp
     align_bits = 8;
   }
   *p_alignment = align_bits / 8;
+}
+
+llvm::GlobalVariable* CodeGenLLVM::AllocateSharedMemory(DataType dtype, size_t size,
+                                                        unsigned int shared_address_space,
+                                                        int alignment,
+                                                        llvm::GlobalValue::LinkageTypes linkage) {
+  llvm::Type* type = llvm::ArrayType::get(DTypeToLLVMType(dtype), size);
+  llvm::GlobalVariable* global =
+      new llvm::GlobalVariable(*module_, type, false, linkage, nullptr, "shmem", nullptr,
+                               llvm::GlobalValue::NotThreadLocal, shared_address_space);
+#if TVM_LLVM_VERSION >= 100
+  global->setAlignment(llvm::Align(alignment));
+#else
+  global->setAlignment(alignment);
+#endif
+  return global;
 }
 
 std::unique_ptr<CodeGenLLVM::DebugInfo> CodeGenLLVM::CreateDebugInfo(llvm::Module* module) {
@@ -602,6 +655,20 @@ llvm::Value* CodeGenLLVM::CreateVecPad(llvm::Value* vec, int target_lanes) {
 }
 
 llvm::Value* CodeGenLLVM::CreateVecConcat(std::vector<llvm::Value*> vecs) {
+  // To allow creating vectors from scalars, convert any scalars in "vecs" to single-lane
+  // LLVM vector types.
+  for (size_t i = 0, e = vecs.size(); i != e; ++i) {
+    llvm::Value* v = vecs[i];
+    if (!v->getType()->isVectorTy()) {
+#if TVM_LLVM_VERSION >= 110
+      llvm::Type* vec_ty = llvm::FixedVectorType::get(v->getType(), 1);
+#else
+      llvm::Type* vec_ty = llvm::VectorType::get(v->getType(), 1);
+#endif
+      vecs[i] = builder_->CreateInsertElement(llvm::UndefValue::get(vec_ty), v, ConstInt32(0));
+    }
+  }
+
   // concat vector, tree shape reduction
   int total_lanes = 0;
 
@@ -646,12 +713,14 @@ void CodeGenLLVM::CreateSerialFor(llvm::Value* begin, llvm::Value* end, llvm::Va
                                   const Var& loop_var, const Stmt& body) {
   using llvm::BasicBlock;
   BasicBlock* pre_block = builder_->GetInsertBlock();
-  BasicBlock* for_begin = BasicBlock::Create(*ctx_, "for_begin", function_);
-  BasicBlock* for_body = BasicBlock::Create(*ctx_, "for_body", function_);
-  BasicBlock* for_end = BasicBlock::Create(*ctx_, "for_end", function_);
+  std::string loop_var_name = loop_var->name_hint;
+  BasicBlock* for_begin = BasicBlock::Create(*ctx_, "for_begin_" + loop_var_name, function_);
+  BasicBlock* for_body = BasicBlock::Create(*ctx_, "for_body_" + loop_var_name, function_);
+  BasicBlock* for_end = BasicBlock::Create(*ctx_, "for_end_" + loop_var_name, function_);
   builder_->CreateBr(for_begin);
   builder_->SetInsertPoint(for_begin);
   llvm::PHINode* loop_value = builder_->CreatePHI(begin->getType(), 2);
+  loop_value->setName(loop_var->name_hint.c_str());
   loop_value->addIncoming(begin, pre_block);
   ICHECK(!var_map_.count(loop_var.get()));
   var_map_[loop_var.get()] = loop_value;
@@ -720,20 +789,86 @@ llvm::Constant* CodeGenLLVM::GetConstString(const std::string& str) {
   return ptr;
 }
 
-llvm::Value* CodeGenLLVM::CreateBufferPtr(DataType t, llvm::Value* buffer, llvm::Value* index) {
-  llvm::PointerType* btype = llvm::dyn_cast<llvm::PointerType>(buffer->getType());
-  ICHECK(btype != nullptr);
-  llvm::PointerType* ptype = DTypeToLLVMType(t)->getPointerTo(btype->getAddressSpace());
-  if (btype != ptype) {
-    buffer = builder_->CreatePointerCast(buffer, ptype);
+CodeGenLLVM::TypedPointer CodeGenLLVM::CreateBufferPtr(llvm::Value* buffer_ptr,
+                                                       DataType buffer_element_dtype,
+                                                       llvm::ArrayRef<llvm::Value*> indices,
+                                                       DataType value_dtype) {
+  ICHECK_EQ(indices.size(), 1) << "CodeGenLLVM requires all buffers to be flat 1-d buffers.";
+  llvm::Value* index = indices[0];
+
+  llvm::PointerType* buffer_ptr_type = llvm::dyn_cast<llvm::PointerType>(buffer_ptr->getType());
+  ICHECK(buffer_ptr_type != nullptr);
+  auto address_space = buffer_ptr_type->getAddressSpace();
+
+  llvm::Type* element_type = DTypeToLLVMType(buffer_element_dtype);
+  llvm::PointerType* element_ptr_type =
+      DTypeToLLVMType(buffer_element_dtype)->getPointerTo(address_space);
+  llvm::Type* value_type = DTypeToLLVMType(value_dtype);
+  llvm::PointerType* value_ptr_type = value_type->getPointerTo(address_space);
+
+  ICHECK(index->getType()->isIntegerTy()) << "Expected buffer index to be an integer";
+
+  if (buffer_ptr_type != element_ptr_type) {
+    buffer_ptr = builder_->CreatePointerCast(buffer_ptr, element_ptr_type);
   }
-  return builder_->CreateInBoundsGEP(buffer, index);
+  ICHECK(!HasAlignmentPadding(buffer_element_dtype))
+      << "DType " << buffer_element_dtype
+      << " has padding for alignment.  TVM data arrays are expected to be densely packed, with no "
+         "padding for alignment.";
+  llvm::Value* value_ptr = builder_->CreateInBoundsGEP(element_type, buffer_ptr, index);
+
+  if (element_ptr_type != value_ptr_type) {
+    value_ptr = builder_->CreatePointerCast(value_ptr, value_ptr_type);
+  }
+
+  return TypedPointer(value_type, value_ptr);
 }
 
 llvm::Value* CodeGenLLVM::GetVarValue(const VarNode* v) const {
   auto it = var_map_.find(v);
   ICHECK(it != var_map_.end()) << "cannot find variable " << v->name_hint;
   return it->second;
+}
+
+void CodeGenLLVM::CreatePrintf(const std::string& format,
+                               llvm::ArrayRef<llvm::Value*> format_args) {
+  llvm::Function* func_printf = module_->getFunction("printf");
+  if (func_printf == nullptr) {
+    llvm::FunctionType* ftype = llvm::FunctionType::get(t_int32_, true);
+    func_printf =
+        llvm::Function::Create(ftype, llvm::Function::ExternalLinkage, "printf", module_.get());
+  }
+
+  llvm::Function* func_fflush = module_->getFunction("fflush");
+  if (!func_fflush) {
+    llvm::FunctionType* ftype = llvm::FunctionType::get(t_int32_, {t_void_p_}, false);
+    func_fflush =
+        llvm::Function::Create(ftype, llvm::Function::ExternalLinkage, "fflush", module_.get());
+  }
+
+  llvm::Value* str = builder_->CreateGlobalStringPtr(format);
+  str->setName("printf_format_str");
+
+  std::vector<llvm::Value*> printf_args = {str};
+  printf_args.insert(printf_args.end(), format_args.begin(), format_args.end());
+  builder_->CreateCall(func_printf, printf_args);
+
+  // Call fflush() immediately, as this utility is intended for debug
+  // purposes.  A segfault occurring within the generated LLVM code
+  // would otherwise leave the stdout buffer unflushed.
+  llvm::Value* null_stream = llvm::ConstantPointerNull::get(t_void_p_);
+  null_stream->setName("null_stream");
+  builder_->CreateCall(func_fflush, {null_stream});
+}
+
+llvm::Value* CodeGenLLVM::CreateLookupReturnAddress(unsigned int level) {
+  llvm::Value* level_val = llvm::ConstantInt::get(t_int32_, level);
+  llvm::Function* builtin =
+      llvm::Intrinsic::getDeclaration(module_.get(), llvm::Intrinsic::returnaddress);
+  llvm::Value* call = builder_->CreateCall(builtin, level_val);
+  call->setName("return_addr");
+
+  return call;
 }
 
 llvm::Value* CodeGenLLVM::CreateCallExtern(Type ret_type, String global_symbol,
@@ -844,7 +979,11 @@ llvm::Value* CodeGenLLVM::CreateIntrinsic(const CallNode* op) {
                                                                 : llvm::Type::getVoidTy(*ctx_);
     llvm::Function* f = GetIntrinsicDecl(id, return_type, arg_type);
     ICHECK(f) << "Cannot find intrinsic declaration, possible type mismatch: "
+#if TVM_LLVM_VERSION >= 130
+              << llvm::Intrinsic::getBaseName(id).str();
+#else
               << llvm::Intrinsic::getName(id, {});
+#endif
     return builder_->CreateCall(f, arg_value);
   } else if (op->op.same_as(builtin::bitwise_and())) {
     return builder_->CreateAnd(MakeValue(op->args[0]), MakeValue(op->args[1]));
@@ -865,20 +1004,18 @@ llvm::Value* CodeGenLLVM::CreateIntrinsic(const CallNode* op) {
   } else if (op->op.same_as(builtin::tvm_storage_sync())) {
     return CreateStorageSync(op);
   } else if (op->op.same_as(builtin::address_of())) {
-    const LoadNode* l = op->args[0].as<LoadNode>();
-    ICHECK(op->args.size() == 1 && l);
-    const RampNode* r = l->index.as<RampNode>();
-    llvm::Value* ptr;
-    unsigned addrspace;
-    if (!r) {
-      ptr = CreateBufferPtr(l->dtype, MakeValue(l->buffer_var), MakeValue(l->index));
-      addrspace = llvm::dyn_cast<llvm::PointerType>(ptr->getType())->getAddressSpace();
-    } else {
-      PrimExpr index = r->base / make_const(DataType::Int(32), r->lanes);
-      ptr = CreateBufferPtr(l->dtype, MakeValue(l->buffer_var), MakeValue(index));
-      addrspace = llvm::dyn_cast<llvm::PointerType>(ptr->getType())->getAddressSpace();
+    const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
+    ICHECK(op->args.size() == 1 && load);
+    ICHECK_EQ(load->indices.size(), 1) << "LLVM only supports flat memory allocations.";
+    PrimExpr index = load->indices[0];
+    if (const RampNode* r = index.as<RampNode>()) {
+      index = r->base;
     }
-    return builder_->CreatePointerCast(ptr, t_char_->getPointerTo(addrspace));
+    TypedPointer buffer_ptr = CreateBufferPtr(MakeValue(load->buffer->data), load->buffer->dtype,
+                                              {MakeValue(index)}, load->dtype);
+    unsigned addrspace =
+        llvm::dyn_cast<llvm::PointerType>(buffer_ptr.addr->getType())->getAddressSpace();
+    return builder_->CreatePointerCast(buffer_ptr.addr, t_char_->getPointerTo(addrspace));
   } else if (op->op.same_as(builtin::reinterpret()) && is_zero(op->args[0])) {
     return llvm::Constant::getNullValue(t_void_p_);
   } else if (op->op.same_as(builtin::isnullptr())) {
@@ -1119,64 +1256,146 @@ llvm::Value* CodeGenLLVM::VisitExpr_(const LetNode* op) {
   } else {
     let_binding_[op->var] = op;
   }
-  var_map_[op->var.get()] = MakeValue(op->value);
+  auto var_value = MakeValue(op->value);
+  var_map_[op->var.get()] = var_value;
+  var_value->setName(op->var->name_hint.c_str());
   analyzer_->Bind(op->var, op->value);
   return MakeValue(op->body);
 }
 
 llvm::Value* CodeGenLLVM::VisitExpr_(const LoadNode* op) {
-  DataType t = op->dtype;
-  bool is_volatile = volatile_buf_.count(op->buffer_var.get());
-  llvm::Value* buffer = MakeValue(op->buffer_var);
-  llvm::Value* index = MakeValue(op->index);
+  LOG(FATAL) << "Unexpected deprecated LoadNode.  Use BufferLoadNode instead.";
+  return nullptr;
+}
 
-  if (t.lanes() == 1) {
-    int alignment, native_bits;
-    GetAlignment(t, op->buffer_var.get(), op->index, &alignment, &native_bits);
-    llvm::Value* ptr = CreateBufferPtr(t, buffer, index);
-#if TVM_LLVM_VERSION >= 110
-    llvm::LoadInst* load = builder_->CreateAlignedLoad(ptr, llvm::Align(alignment), is_volatile);
-#else
-    llvm::LoadInst* load = builder_->CreateAlignedLoad(ptr, alignment, is_volatile);
-#endif
-    AddAliasInfo(load, op->buffer_var.get(), op->index);
-    return load;
-  } else {
-    // vector load
-    unsigned addrspace = llvm::dyn_cast<llvm::PointerType>(buffer->getType())->getAddressSpace();
-    if (const RampNode* ramp = op->index.as<RampNode>()) {
-      if (is_one(ramp->stride)) {
-        int alignment, native_bits;
-        GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
-        ICHECK_EQ(ramp->lanes, t.lanes());
-        llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
-        ptr = builder_->CreatePointerCast(ptr, DTypeToLLVMType(t)->getPointerTo(addrspace));
-#if TVM_LLVM_VERSION >= 110
-        llvm::LoadInst* load =
-            builder_->CreateAlignedLoad(ptr, llvm::Align(alignment), is_volatile);
-#else
-        llvm::LoadInst* load = builder_->CreateAlignedLoad(ptr, alignment, is_volatile);
-#endif
-        AddAliasInfo(load, op->buffer_var.get(), op->index);
-        return load;
-      }
+bool CodeGenLLVM::HasAlignmentPadding(DataType dtype) {
+  const llvm::DataLayout& data_layout = module_->getDataLayout();
+  int bytes = data_layout.getTypeAllocSize(DTypeToLLVMType(dtype));
+  int bytes_scalar = data_layout.getTypeAllocSize(DTypeToLLVMType(dtype.element_of()));
+  return bytes != bytes_scalar * dtype.lanes();
+}
+
+void CodeGenLLVM::BufferAccessHelper(
+    Buffer buffer, Array<PrimExpr> indices, DataType value_dtype,
+    std::function<llvm::Instruction*(TypedPointer buffer_ptr, int subelement_i, int alignment,
+                                     bool is_volatile)>
+        make_instruction) {
+  DataType buffer_element_dtype = buffer->dtype;
+
+  ICHECK_GE(indices.size(), 1)
+      << "Buffer " << buffer->name << " is accessed with no indices.  "
+      << "0-d scalar buffers are expected to be flattened to 1-d buffers prior to codegen.";
+
+  // Only the last index is allowed to be multi-lane.  All earlier
+  // indices must be scalar.  This only matters for subclasses of
+  // CodeGenLLVM, because the default implementation of GetBufferPtr
+  // requires 1-d indices.
+  std::vector<llvm::Value*> earlier_index_values;
+  for (size_t i = 0; i < indices.size() - 1; i++) {
+    ICHECK_EQ(indices[i].dtype().lanes(), 1)
+        << "Buffer " << buffer->name << " is accessed with a multi-lane index at position " << i
+        << ".  Multi-lane indices are only supported as the last index.";
+    earlier_index_values.push_back(MakeValue(indices[i]));
+  }
+
+  PrimExpr last_index = indices[indices.size() - 1];
+  ICHECK_EQ(value_dtype.lanes(), last_index.dtype().lanes() * buffer_element_dtype.lanes());
+
+  bool is_volatile = volatile_buf_.count(buffer->data.get());
+
+  // If the buffer index is a contiguous ramp node, we only need to
+  // access the first element, then cast to the value type.
+  if (const RampNode* ramp_index = last_index.as<RampNode>()) {
+    if (ramp_index && is_one(ramp_index->stride)) {
+      last_index = ramp_index->base;
     }
   }
-  // scalarized load.
-  int basic_align = t.bits() / 8;
-  llvm::Value* ret = llvm::UndefValue::get(DTypeToLLVMType(t));
-  auto f = [&](int i, llvm::Value* index) {
-    llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, index);
+
+  // All TVM arrays are densely packed.  If the vectorized LLVM type
+  // contains padding for alignment, we need to index based on the
+  // size of the scalar type to avoid introducing that padding.
+  if (last_index.dtype().lanes() == 1 && HasAlignmentPadding(buffer_element_dtype)) {
+    last_index = buffer_element_dtype.lanes() * last_index;
+    buffer_element_dtype = buffer_element_dtype.element_of();
+  }
+
+  int alignment;
+  if (last_index.dtype().lanes() == 1) {
+    // If we are accessing with a single index, then the vectorized
+    // element being accessed may require more alignment than the
+    // underlying data type.
+    int native_bits;
+    GetAlignment(value_dtype, buffer->data.get(), last_index, &alignment, &native_bits);
+  } else {
+    // Otherwise, alignment is based on the return value's scalar
+    // type.
+    ICHECK_GE(value_dtype.bits(), 8);
+    alignment = value_dtype.bits() / 8;
+  }
+
+  llvm::Value* cached_vector_index = nullptr;
+  for (int i = 0; i < last_index.dtype().lanes(); ++i) {
+    llvm::Value* last_index_value;
+    int subelement_i = i;
+    if (const RampNode* ramp = last_index.as<RampNode>()) {
+      PrimExpr offset = ramp->base + (ramp->stride * i);
+      last_index_value = MakeValue(offset);
+    } else if (last_index.dtype().lanes() > 1) {
+      if (i == 0) {
+        cached_vector_index = MakeValue(last_index);
+      }
+      last_index_value = builder_->CreateExtractElement(cached_vector_index, i);
+    } else {
+      last_index_value = MakeValue(last_index);
+      subelement_i = -1;
+    }
+
+    std::vector<llvm::Value*> all_index_values = earlier_index_values;
+    all_index_values.push_back(last_index_value);
+
+    TypedPointer buffer_ptr =
+        CreateBufferPtr(MakeValue(buffer->data), buffer_element_dtype, all_index_values,
+                        value_dtype.with_lanes(value_dtype.lanes() / last_index.dtype().lanes()));
+    auto instruction = make_instruction(buffer_ptr, subelement_i, alignment, is_volatile);
+    AddAliasInfo(instruction, buffer->data.get(), last_index);
+  }
+}
+
+llvm::Value* CodeGenLLVM::VisitExpr_(const BufferLoadNode* op) {
+  DataType value_dtype = op->dtype;
+
+  std::vector<llvm::Value*> loads;
+
+  auto make_load = [this, &loads](TypedPointer buffer_ptr, int /* subelement_i */, int alignment,
+                                  bool is_volatile) {
 #if TVM_LLVM_VERSION >= 110
-    llvm::LoadInst* load = builder_->CreateAlignedLoad(ptr, llvm::Align(basic_align), is_volatile);
+    auto load = builder_->CreateAlignedLoad(buffer_ptr.type, buffer_ptr.addr,
+                                            llvm::Align(alignment), is_volatile);
+#elif TVM_LLVM_VERSION >= 80
+    auto load =
+        builder_->CreateAlignedLoad(buffer_ptr.type, buffer_ptr.addr, alignment, is_volatile);
 #else
-    llvm::LoadInst* load = builder_->CreateAlignedLoad(ptr, basic_align, is_volatile);
+    auto load = builder_->CreateAlignedLoad(buffer_ptr.addr, alignment, is_volatile);
 #endif
-    ret = builder_->CreateInsertElement(ret, load, ConstInt32(i));
-    AddAliasInfo(load, op->buffer_var.get(), PrimExpr());
+
+    loads.push_back(load);
+    return load;
   };
-  this->Scalarize(op->index, f);
-  return ret;
+
+  // Pass all indices into BufferAccessHelper.  In CodeGenLLVM,
+  // non-flat indices will result in an error in CreateBufferPtr, but
+  // a subclass may override CreateBufferPtr.
+  BufferAccessHelper(op->buffer, op->indices, value_dtype, make_load);
+
+  if (loads.size() == 1) {
+    return loads[0];
+  } else {
+    llvm::Value* ret = llvm::UndefValue::get(DTypeToLLVMType(value_dtype));
+    for (size_t i = 0; i < loads.size(); i++) {
+      ret = builder_->CreateInsertElement(ret, loads[i], ConstInt32(i));
+    }
+    return ret;
+  }
 }
 
 llvm::Value* CodeGenLLVM::VisitExpr_(const CallNode* op) {
@@ -1240,61 +1459,33 @@ llvm::Value* CodeGenLLVM::VisitExpr_(const BroadcastNode* op) {
 }
 
 void CodeGenLLVM::VisitStmt_(const StoreNode* op) {
-  ICHECK(is_one(op->predicate)) << op->predicate;
-  DataType t = op->value.dtype();
-  bool is_volatile = volatile_buf_.count(op->buffer_var.get());
-  llvm::Value* buffer = MakeValue(op->buffer_var);
-  llvm::Value* index = MakeValue(op->index);
+  LOG(FATAL) << "Unexpected deprecated StoreNode.  Use BufferStoreNode instead.";
+}
+
+void CodeGenLLVM::VisitStmt_(const BufferStoreNode* op) {
+  DataType value_dtype = op->value.dtype();
+  Var buffer_var = op->buffer->data;
+
   llvm::Value* value = MakeValue(op->value);
 
-  if (t.lanes() == 1) {
-    int alignment, native_bits;
-    GetAlignment(t, op->buffer_var.get(), op->index, &alignment, &native_bits);
-    llvm::Value* ptr = CreateBufferPtr(t, buffer, index);
-#if TVM_LLVM_VERSION >= 110
-    llvm::StoreInst* store =
-        builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
-#else
-    llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
-#endif
-    AddAliasInfo(store, op->buffer_var.get(), op->index);
-    return;
-  } else {
-    // vector store
-    unsigned addrspace = llvm::dyn_cast<llvm::PointerType>(buffer->getType())->getAddressSpace();
-    if (const RampNode* ramp = op->index.as<RampNode>()) {
-      if (is_one(ramp->stride)) {
-        int alignment, native_bits;
-        GetAlignment(t, op->buffer_var.get(), ramp->base, &alignment, &native_bits);
-        ICHECK_EQ(ramp->lanes, t.lanes());
-        llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, MakeValue(ramp->base));
-        ptr = builder_->CreatePointerCast(ptr, DTypeToLLVMType(t)->getPointerTo(addrspace));
-#if TVM_LLVM_VERSION >= 110
-        llvm::StoreInst* store =
-            builder_->CreateAlignedStore(value, ptr, llvm::Align(alignment), is_volatile);
-#else
-        llvm::StoreInst* store = builder_->CreateAlignedStore(value, ptr, alignment, is_volatile);
-#endif
-        AddAliasInfo(store, op->buffer_var.get(), op->index);
-        return;
-      }
+  auto make_store = [this, value](TypedPointer buffer_ptr, int subelement_i, int alignment,
+                                  bool is_volatile) {
+    llvm::Value* to_store = value;
+    if (subelement_i != -1) {
+      to_store = builder_->CreateExtractElement(value, subelement_i);
     }
-  }
-  ICHECK_GE(t.bits(), 8);
-  // scalarized store.
-  int basic_align = t.bits() / 8;
-  auto f = [&](int i, llvm::Value* index) {
-    llvm::Value* ptr = CreateBufferPtr(t.element_of(), buffer, index);
 #if TVM_LLVM_VERSION >= 110
-    llvm::StoreInst* store = builder_->CreateAlignedStore(
-        builder_->CreateExtractElement(value, i), ptr, llvm::Align(basic_align), is_volatile);
+    return builder_->CreateAlignedStore(to_store, buffer_ptr.addr, llvm::Align(alignment),
+                                        is_volatile);
 #else
-    llvm::StoreInst* store = builder_->CreateAlignedStore(builder_->CreateExtractElement(value, i),
-                                                          ptr, basic_align, is_volatile);
+    return builder_->CreateAlignedStore(to_store, buffer_ptr.addr, alignment, is_volatile);
 #endif
-    AddAliasInfo(store, op->buffer_var.get(), PrimExpr());
   };
-  this->Scalarize(op->index, f);
+
+  // Pass all indices into BufferAccessHelper.  In CodeGenLLVM,
+  // non-flat indices will result in an error in CreateBufferPtr, but
+  // a subclass may override CreateBufferPtr.
+  BufferAccessHelper(op->buffer, op->indices, value_dtype, make_store);
 }
 
 void CodeGenLLVM::VisitStmt_(const ForNode* op) {
@@ -1347,11 +1538,26 @@ void CodeGenLLVM::VisitStmt_(const IfThenElseNode* op) {
   builder_->SetInsertPoint(end_block);
 }
 
+void CodeGenLLVM::VisitStmt_(const AllocateConstNode* op) {
+  auto data = op->data.value();
+  auto array = NDArrayToLLVMArray(ctx_, data);
+  std::string symbol_name = op->buffer_var->name_hint;
+  llvm::GlobalVariable* param_symbol = new llvm::GlobalVariable(
+      *module_, array->getType(), true, llvm::GlobalValue::InternalLinkage, array, symbol_name);
+
+  var_map_[op->buffer_var.operator->()] = param_symbol;
+  this->VisitStmt(op->body);
+}
+
 void CodeGenLLVM::VisitStmt_(const AllocateNode* op) {
+  ICHECK_EQ(op->extents.size(), 1)
+      << "LLVM codegen only supports flat 1-d buffer allocation, but allocation of "
+      << op->buffer_var->name_hint << " is " << op->extents << "-d";
+
   ICHECK(!is_zero(op->condition));
   llvm::Value* buf = nullptr;
 
-  int32_t constant_size = op->constant_allocation_size();
+  size_t constant_size = op->ConstantAllocationSize();
   ICHECK_GT(constant_size, 0) << "Can only handle constant size stack allocation";
   StorageInfo& info = alloc_storage_info_[op->buffer_var.get()];
   if (constant_size % 4 == 0 && info.alignment == 0) {
@@ -1376,6 +1582,8 @@ void CodeGenLLVM::VisitStmt_(const AllocateNode* op) {
 
   buf = builder_->CreatePointerCast(
       buf, DTypeToLLVMType(op->dtype)->getPointerTo(buf->getType()->getPointerAddressSpace()));
+  buf->setName(op->buffer_var->name_hint.c_str());
+
   ICHECK(!var_map_.count(op->buffer_var.get()));
   var_map_[op->buffer_var.get()] = buf;
   this->VisitStmt(op->body);
@@ -1390,11 +1598,6 @@ void CodeGenLLVM::VisitStmt_(const AttrStmtNode* op) {
         analyzer_->Bind(iv->var, Range::FromMinExtent(0, op->value));
       }
     }
-  } else if (op->attr_key == tir::attr::storage_scope) {
-    const VarNode* v = op->node.as<VarNode>();
-    ICHECK(v);
-    alloc_storage_info_[v].scope =
-        runtime::StorageScope::Create(op->value.as<StringImmNode>()->value);
   } else if (op->attr_key == tir::attr::storage_alignment) {
     const VarNode* v = op->node.as<VarNode>();
     ICHECK(v);
@@ -1424,7 +1627,9 @@ void CodeGenLLVM::VisitStmt_(const LetStmtNode* op) {
       alias_var_set_.insert(v);
     }
   }
-  var_map_[v] = MakeValue(op->value);
+  llvm::Value* value = MakeValue(op->value);
+  value->setName(v->name_hint.c_str());
+  var_map_[v] = value;
   analyzer_->Bind(op->var, op->value);
   if (alloc_storage_info_.count(v) && alloc_storage_info_[v].alignment > 1) {
     builder_->CreateAlignmentAssumption(*data_layout_, GetVarValue(v),

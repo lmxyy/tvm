@@ -26,10 +26,10 @@ from tvm.contrib import cblas
 from tvm.contrib import mkl
 from tvm.contrib import mkldnn
 
-from .utils import get_fp32_len
-from .injective import schedule_injective_from_existing
-from .. import tag
+from .utils import get_simd_32bit_lanes
+from .. import generic, tag
 from ..utils import traverse_inline, get_const_tuple
+from .tensor_intrin import dot_16x1x16_uint8_int8_int32_cascadelake
 
 
 def _schedule_dense_pack_template(cfg, s, C, O):
@@ -108,7 +108,7 @@ def _default_dense_pack_config(cfg, M, N, K):
     if isinstance(K, (tvm.tir.Var, tvm.tir.Any)):
         K = 16
 
-    vec_width = get_fp32_len()
+    vec_width = get_simd_32bit_lanes()
     tilex_ii = 1
     for bn in range(vec_width * 2, 0, -1):
         if N % bn == 0:
@@ -146,7 +146,7 @@ def _default_dense_nopack_config(cfg, M, N, K):
     if isinstance(K, (tvm.tir.Var, tvm.tir.Any)):
         K = 16
 
-    vec_width = get_fp32_len()
+    vec_width = get_simd_32bit_lanes()
     tilek_bn = 1
     for bn in range(vec_width * 2, 0, -1):
         if K % bn == 0:
@@ -155,7 +155,6 @@ def _default_dense_nopack_config(cfg, M, N, K):
     cfg["tile_k"] = SplitEntity([K // tilek_bn, tilek_bn])
     cfg["tile_x"] = SplitEntity([N, 1])
     cfg["tile_y"] = SplitEntity([1, M])
-    return M, N, K
 
 
 @autotvm.register_topi_compute("dense_nopack.x86")
@@ -176,7 +175,7 @@ def dense_nopack(cfg, data, weight, bias=None, out_dtype=None):
         "tile_k", 32 if isinstance(K, (tvm.tir.Var, tvm.tir.Any)) else K, num_outputs=2
     )
     if cfg.is_fallback:
-        M, N, K = _default_dense_nopack_config(cfg, M, N, K)
+        _default_dense_nopack_config(cfg, M, N, K)
 
     vec = cfg["tile_k"].size[-1]
     k = te.reduce_axis((0, K // vec), "k")
@@ -281,6 +280,101 @@ def schedule_dense_pack(cfg, outs):
     return s
 
 
+def dense_vnni_compute(cfg, X, packed_w, bias=None):
+    """Compute for uint8 x int8 -> int32 dense"""
+    m, k = X.shape
+    n_o, _, n_i, _ = packed_w.shape
+    ak = te.reduce_axis((0, k), name="k")
+
+    C = te.compute(
+        (m, n_o * n_i),
+        lambda i, j: te.sum(
+            X[i, ak].astype("int32")
+            * packed_w[tvm.tir.indexdiv(j, 16), tvm.tir.indexdiv(ak, 4), j % 16, ak % 4].astype(
+                "int32"
+            ),
+            axis=ak,
+        ),
+        tag="dense_vnni",
+        attrs={"schedule_rule": "meta_schedule.dense_vnni"},
+    )
+
+    if bias is not None:
+        C = te.compute(C.shape, lambda i, j: C[i, j] + bias[j], tag=tag.BROADCAST)
+
+    a_y, _ = C.op.axis
+    cfg.define_split("tile_y", a_y, num_outputs=2)
+
+    return C
+
+
+def dense_vnni_schedule(cfg, s, C, O, do_parallel=True):
+    """Schedule dense compute using VNNI vpdpbusd instruction"""
+    # C: The output of GEMM
+    # O: The output of the fused op
+    def split_y(out):
+        default_y_split_factor = 32
+        a_y = out.op.axis[-2]
+
+        if cfg.is_fallback:
+            return s[out].split(a_y, factor=default_y_split_factor)
+
+        return cfg["tile_y"].apply(s, out, a_y)
+
+    (a_k,) = C.op.reduce_axis
+
+    a_yo, a_yi = split_y(C)
+    a_xo, a_xi = s[C].split(C.op.axis[-1], factor=16)
+    a_ko, a_ki = s[C].split(a_k, factor=4)
+
+    s[C].reorder(a_yo, a_xo, a_yi, a_ko, a_xi, a_ki)
+
+    pc = dot_16x1x16_uint8_int8_int32_cascadelake()
+    s[C].tensorize(a_xi, pc)
+
+    if C == O:
+        fused = s[O].fuse(a_yo, a_xo)
+    else:
+        a_yo, a_yi = split_y(O)
+        a_xo, a_xi = s[O].split(O.op.axis[-1], factor=16)
+
+        s[O].reorder(a_yo, a_xo, a_yi, a_xi)
+        s[O].vectorize(a_xi)
+        s[C].compute_at(s[O], a_yi)
+
+        fused = s[O].fuse(a_yo, a_xo)
+
+    if do_parallel:
+        s[O].parallel(fused)
+
+    return s, fused
+
+
+@autotvm.register_topi_compute("dense_vnni.x86")
+def dense_vnni(cfg, data, weight, bias=None, out_dtype=None):
+    """Compute for uint8 x int8 -> int32 dense"""
+    if out_dtype is None:
+        out_dtype = data.dtype
+    assert len(weight.shape) == 4
+    assert data.dtype == "uint8" and weight.dtype == "int8"
+    _, _, n_inner, k_inner = get_const_tuple(weight.shape)  # out_dim
+    assert n_inner == 16 and k_inner == 4
+    return dense_vnni_compute(cfg, data, weight, bias)
+
+
+@autotvm.register_topi_schedule("dense_vnni.x86")
+def schedule_dense_vnni(cfg, outs):
+    """Create a schedule for dense_vnni"""
+    s = te.create_schedule([x.op for x in outs])
+
+    def _callback(op):
+        if "dense_vnni" in op.tag:
+            dense_vnni_schedule(cfg, s, op.output(0), outs[0])
+
+    traverse_inline(s, outs[0].op, _callback)
+    return s
+
+
 def matmul_blas_common(cfg, tensor_a, tensor_b, bias, out_dtype, transpose_a, transpose_b, lib):
     """Compute matmul/dense using a BLAS library"""
     M, K = get_const_tuple(tensor_a.shape)
@@ -306,17 +400,6 @@ def matmul_blas_common(cfg, tensor_a, tensor_b, bias, out_dtype, transpose_a, tr
     return C
 
 
-def schedule_matmul_blas_common(outs):
-    """Default matmul schedule for BLAS library"""
-    s = te.create_schedule([x.op for x in outs])
-    te.schedule.AutoInlineInjective(s)
-
-    for out in outs:
-        if "dense" not in out.op.tag and "matmul" not in out.op.tag:
-            schedule_injective_from_existing(s, out)
-    return s
-
-
 @autotvm.register_topi_compute("dense_cblas.x86")
 def dense_cblas(cfg, data, weight, bias=None, out_dtype=None):
     """Compute dense using cblas. This is an alias of matmul_nt operator."""
@@ -326,7 +409,7 @@ def dense_cblas(cfg, data, weight, bias=None, out_dtype=None):
 @autotvm.register_topi_schedule("dense_cblas.x86")
 def schedule_dense_cblas(_, outs):
     """Create schedule for dense_cblas. This is an alias of matmul_nt operator."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)
 
 
 @autotvm.register_topi_compute("dense_mkl.x86")
@@ -338,7 +421,7 @@ def dense_mkl(cfg, data, weight, bias=None, out_dtype=None):
 @autotvm.register_topi_schedule("dense_mkl.x86")
 def schedule_dense_mkl(_, outs):
     """Create schedule for dense_mkl. This is an alias of matmul_nt operator."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)
 
 
 @autotvm.register_topi_compute("dense_mkldnn.x86")
@@ -350,7 +433,7 @@ def dense_mkldnn(cfg, data, weight, bias=None, out_dtype=None):
 @autotvm.register_topi_schedule("dense_mkldnn.x86")
 def schedule_dense_mkldnn(_, outs):
     """Create schedule for dense_mkldnn. This is an alias of matmul_nt operator."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)
 
 
 @autotvm.register_topi_compute("matmul_cblas.x86")
@@ -366,7 +449,7 @@ def matmul_cblas(
 @autotvm.register_topi_schedule("matmul_cblas.x86")
 def schedule_matmul_cblas(_, outs):
     """Create schedule for matmul_cblas."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)
 
 
 @autotvm.register_topi_compute("matmul_mkl.x86")
@@ -382,7 +465,7 @@ def matmul_mkl(
 @autotvm.register_topi_schedule("matmul_mkl.x86")
 def schedule_matmul_mkl(_, outs):
     """Create schedule for matmul_mkl."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)
 
 
 @autotvm.register_topi_compute("matmul_mkldnn.x86")
@@ -398,4 +481,4 @@ def matmul_mkldnn(
 @autotvm.register_topi_schedule("matmul_mkldnn.x86")
 def schedule_matmul_mkldnn(_, outs):
     """Create schedule for matmul_mkldnn."""
-    return schedule_matmul_blas_common(outs)
+    return generic.schedule_extern(outs)

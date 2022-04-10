@@ -89,6 +89,7 @@ class CodeGenHybrid : public ExprFunctor<void(const PrimExpr&, std::ostream&)>,
   // expression
   void VisitExpr_(const VarNode* op, std::ostream& os) override;           // NOLINT(*)
   void VisitExpr_(const LoadNode* op, std::ostream& os) override;          // NOLINT(*)
+  void VisitExpr_(const BufferLoadNode* op, std::ostream& os) override;    // NOLINT(*)
   void VisitExpr_(const LetNode* op, std::ostream& os) override;           // NOLINT(*)
   void VisitExpr_(const CallNode* op, std::ostream& os) override;          // NOLINT(*)
   void VisitExpr_(const ProducerLoadNode* op, std::ostream& os) override;  // NOLINT(*)
@@ -120,6 +121,7 @@ class CodeGenHybrid : public ExprFunctor<void(const PrimExpr&, std::ostream&)>,
   // statment
   void VisitStmt_(const LetStmtNode* op) override;
   void VisitStmt_(const StoreNode* op) override;
+  void VisitStmt_(const BufferStoreNode* op) override;
   void VisitStmt_(const ProducerStoreNode* op) override;
   void VisitStmt_(const ForNode* op) override;
   void VisitStmt_(const IfThenElseNode* op) override;
@@ -168,8 +170,6 @@ class CodeGenHybrid : public ExprFunctor<void(const PrimExpr&, std::ostream&)>,
    * \param tensor The tensor to allocate a name.
    */
   std::string GetTensorID(const Tensor& tensor);
-  /*! \brief the storage scope of allocation */
-  std::map<Operation, std::string> alloc_storage_scope_;
 };
 
 }  // namespace contrib

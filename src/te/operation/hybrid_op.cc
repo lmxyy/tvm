@@ -144,7 +144,7 @@ void HybridOpNode::GatherBound(const Operation& self,
 
 Stmt HybridOpNode::BuildRealize(const Stage& stage,
                                 const std::unordered_map<IterVar, Range>& realize_map,
-                                const Stmt& body) const {
+                                const Stmt& body, String storage_scope) const {
   // TODO(@were): Add attribute inject here and remove it from hybrid parser.
   ICHECK_EQ(stage->op.get(), this);
   Stmt realize_body = body;
@@ -154,7 +154,7 @@ Stmt HybridOpNode::BuildRealize(const Stage& stage,
     for (size_t i = 0; i < t->shape.size(); ++i) {
       bounds.push_back(Range::FromMinExtent(make_const(t->shape[i].dtype(), 0), t->shape[i]));
     }
-    realize_body = tir::ProducerRealize(t, bounds, const_true(), realize_body);
+    realize_body = tir::ProducerRealize(t, bounds, const_true(), realize_body, storage_scope);
   }
   return realize_body;
 }
@@ -448,7 +448,7 @@ std::vector<IterVar> GatherLoopVars(Stmt stmt) {
   PostOrderVisit(stmt, [&res_](const ObjectRef& node) {
     if (const ForNode* op = node.as<ForNode>()) {
       Var loop_var(op->loop_var);
-      Range dom = Range::FromMinExtent(op->min, op->extent);
+      Range dom = Range::FromMinExtent(op->min, cast(loop_var.dtype(), op->extent));
       res_.push_back(IterVar(dom, loop_var, ForKindToIterVarType(op->kind)));
     }
   });

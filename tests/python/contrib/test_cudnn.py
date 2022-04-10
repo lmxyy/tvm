@@ -21,15 +21,18 @@ import pytest
 
 import tvm
 from tvm import te
+from tvm import relay
 from tvm.contrib import cudnn
 from tvm.contrib.nvcc import have_fp16
+from tvm.contrib import graph_executor
 import numpy as np
 import tvm.topi.testing
 import tvm.testing
+from tvm.relay.op.contrib.cudnn import partition_for_cudnn
 
 
 requires_cudnn = pytest.mark.skipif(
-    tvm.get_global_func("tvm.contrib.cudnn.conv.output_shape_from_cudnn", True) is None,
+    tvm.get_global_func("tvm.contrib.cudnn.conv2d.forward", True) is None,
     reason="CuDNN is not enabled",
 )
 
@@ -98,11 +101,12 @@ def verify_conv2d(data_dtype, conv_dtype, tensor_format=0, groups=1):
 
 
 @tvm.testing.requires_gpu
+@requires_cudnn
 def test_conv2d():
     verify_conv2d("float32", "float32", tensor_format=0)
     verify_conv2d("float16", "float32", tensor_format=1)
-    # This test is flaky, disable for now
-    # verify_conv2d("float16", "float16", tensor_format=0)
+    verify_conv2d("float16", "float16", tensor_format=0)
+    verify_conv2d("float16", "float16", tensor_format=1)
     verify_conv2d("int8", "int32", tensor_format=1)
 
     verify_conv2d("float32", "float32", tensor_format=0, groups=2)
@@ -171,6 +175,7 @@ def verify_conv3d(data_dtype, conv_dtype, tensor_format=0, groups=1):
 
 
 @tvm.testing.requires_gpu
+@requires_cudnn
 def test_conv3d():
     verify_conv3d("float32", "float32", tensor_format=0)
     verify_conv3d("float32", "float32", tensor_format=0, groups=2)
@@ -232,6 +237,144 @@ def test_softmax():
     verify_softmax((1, 5), -1, "float64", log_softmax=True)
     verify_softmax_4d((1, 16, 256, 256), log_softmax=True)
     verify_softmax_4d((1, 16, 256, 256), "float64", log_softmax=True)
+
+
+def verify_conv2d_backward_data(data_dtype, conv_dtype, tensor_format=0, tol=1e-5):
+    batch = 3
+    in_channel = 4
+    out_channel = 16
+    filter_h, filter_w = 3, 3
+    pad_h, pad_w = 1, 1
+    stride_h, stride_w = 1, 1
+    height, width = 32, 32
+
+    if tensor_format == 0:
+        xshape = [batch, in_channel, height, width]
+        wshape = [out_channel, in_channel, filter_h, filter_w]
+        oshape = xshape
+        oshape[1] = out_channel
+        ref_func = tvm.topi.testing.conv2d_transpose_nchw_python
+    else:
+        xshape = [batch, height, width, in_channel]
+        wshape = [out_channel, filter_h, filter_w, in_channel]
+        oshape = xshape
+        oshape[3] = out_channel
+        ref_func = lambda dy_np, w_np, strides, padding, out_pad: tvm.topi.testing.conv2d_transpose_nhwc_python(
+            dy_np, np.transpose(w_np, [1, 2, 3, 0]), "HWOI", strides, padding, out_pad
+        )
+
+    dy_np = np.random.uniform(-1, 1, oshape).astype(data_dtype)
+    w_np = np.random.uniform(-1, 1, wshape).astype(data_dtype)
+
+    if data_dtype == "float16":
+        dx_np = ref_func(
+            dy_np.astype("float32"),
+            w_np.astype("float32"),
+            (stride_h, stride_w),
+            (pad_h, pad_w),
+            (0, 0),
+        )
+        dx_np = dx_np.astype("float16")
+    else:
+        dx_np = ref_func(dy_np, w_np, (stride_h, stride_w), (pad_h, pad_w), (0, 0))
+
+    dy = te.placeholder(oshape, name="dy", dtype=data_dtype)
+    w = te.placeholder(wshape, name="dw", dtype=data_dtype)
+    dx = cudnn.conv_backward_data(
+        dy,
+        w,
+        [pad_h, pad_w],
+        [stride_h, stride_w],
+        [1, 1],
+        conv_mode=1,
+        tensor_format=tensor_format,
+        conv_dtype=conv_dtype,
+        groups=1,
+    )
+
+    s = te.create_schedule(dx.op)
+
+    dev = tvm.cuda(0)
+    f = tvm.build(s, [dy, w, dx], "cuda --host=llvm", name="conv2d_backward_data")
+
+    dy = tvm.nd.array(dy_np, dev)
+    w = tvm.nd.array(w_np, dev)
+    dx = tvm.nd.array(dx_np, dev)
+
+    f(dy, w, dx)
+    tvm.testing.assert_allclose(dx.numpy(), dx_np, atol=tol, rtol=tol)
+
+
+@tvm.testing.requires_gpu
+@requires_cudnn
+def test_conv2d_backward_data():
+    verify_conv2d_backward_data("float32", "float32", tensor_format=0, tol=1e-5)
+    verify_conv2d_backward_data("float32", "float32", tensor_format=1, tol=1e-2)
+    # The scipy convolve function does not support fp16, so the reference will be computed with
+    # fp32. Use larger tolerance to be on the safe side (1e-2 also seems mostly ok).
+    verify_conv2d_backward_data("float16", "float16", tensor_format=1, tol=1e-1)
+
+
+def verify_conv2d_backward_filter(data_dtype, conv_dtype, tensor_format=0, tol=1e-5):
+    batch = 3
+    in_channel = 4
+    out_channel = 16
+    filter_h, filter_w = 3, 3
+    pad_h, pad_w = 1, 1
+    stride_h, stride_w = 1, 1
+    height, width = 32, 32
+
+    if tensor_format == 0:
+        x_shape = [batch, in_channel, height, width]
+        dy_shape = [batch, out_channel, height, width]
+    else:
+        x_shape = [batch, height, width, in_channel]
+        dy_shape = [batch, height, width, out_channel]
+
+    x_np = np.random.uniform(-1, 1, x_shape).astype(data_dtype)
+    dy_np = np.random.uniform(-1, 1, dy_shape).astype(data_dtype)
+
+    dw_np = tvm.topi.testing.conv2d_backward_weight_python(
+        dy_np,
+        x_np,
+        (filter_h, filter_w),
+        (stride_h, stride_w),
+        (pad_h, pad_w),
+        "NCHW" if tensor_format == 0 else "NHWC",
+    )
+
+    x = te.placeholder(x_shape, name="x", dtype=data_dtype)
+    dy = te.placeholder(dy_shape, name="dy", dtype=data_dtype)
+    dw = cudnn.conv_backward_filter(
+        dy,
+        x,
+        (filter_h, filter_w),
+        [pad_h, pad_w],
+        [stride_h, stride_w],
+        [1, 1],
+        conv_mode=1,
+        tensor_format=tensor_format,
+        conv_dtype=conv_dtype,
+    )
+
+    s = te.create_schedule(dw.op)
+
+    dev = tvm.cuda(0)
+    f = tvm.build(s, [dy, x, dw], "cuda --host=llvm", name="conv2d_backward_filter")
+
+    x = tvm.nd.array(x_np, dev)
+    dy = tvm.nd.array(dy_np, dev)
+    dw = tvm.nd.array(dw_np, dev)
+
+    f(dy, x, dw)
+    tvm.testing.assert_allclose(dw.numpy(), dw_np, atol=tol, rtol=tol)
+
+
+@tvm.testing.requires_gpu
+@requires_cudnn
+def test_conv2d_backward_filter():
+    verify_conv2d_backward_filter("float32", "float32", tensor_format=0, tol=1e-2)
+    verify_conv2d_backward_filter("float32", "float32", tensor_format=1, tol=1e-2)
 
 
 test_kwargs_default_2d = {
@@ -305,12 +448,69 @@ def conv_output_shape_kwargs(request):
     return request.param
 
 
-@tvm.testing.requires_gpu
-@requires_cudnn
-def test_conv_output_shape(conv_output_shape_kwargs):
-    shape_from_cudnn = cudnn._conv_output_shape_from_cudnn(**conv_output_shape_kwargs)
-    shape_from_python = cudnn.conv_output_shape(**conv_output_shape_kwargs)
-    assert shape_from_cudnn == shape_from_python
+def _verify_cudnn_relay(expr):
+    np.random.seed(42)
+
+    mod = tvm.IRModule.from_expr(expr)
+    mod = relay.transform.InferType()(mod)
+    func = mod["main"]
+    cudnn_mod = partition_for_cudnn(mod)
+    assert len(cudnn_mod.get_global_vars()) == 2
+
+    input_data = []
+    for param in func.params:
+        shape = [int(x) for x in param.checked_type.shape]
+        input_data.append(
+            (param.name_hint, np.random.uniform(0, 32, size=shape).astype(param.checked_type.dtype))
+        )
+
+    # Test against CPU reference
+    cuda_config = (tvm.target.cuda(), tvm.cuda(), cudnn_mod)
+    cpu_config = (tvm.target.Target("llvm"), tvm.cpu(), mod)
+    outputs = []
+    for target, dev, test_mod in [cuda_config, cpu_config]:
+        with tvm.transform.PassContext(opt_level=3):
+            lib = relay.build(test_mod, target=target, target_host=cpu_config[0])
+            module = graph_executor.GraphModule(lib["default"](dev))
+            for name, data in input_data:
+                module.set_input(name, tvm.nd.array(data, dev))
+
+            module.run()
+            out_type = func.body.checked_type
+            outputs.append(
+                module.get_output(0, tvm.nd.empty(out_type.shape, dtype=out_type.dtype)).numpy()
+            )
+
+    tvm.testing.assert_allclose(
+        outputs[0],
+        outputs[1],
+        rtol=1e-3,
+    )
+
+
+@tvm.testing.requires_cuda
+@pytest.mark.parametrize(
+    "shape,axis",
+    [
+        ((200,), 0),
+        ((13, 27), 0),
+        ((44, 12, 67), 1),
+        ((1, 16, 16, 8), 2),
+        ((2, 4, 6, 8, 10), 3),
+    ],
+)
+@pytest.mark.parametrize(
+    "dtype",
+    [
+        "float32",
+        "float16",
+        "float64",
+    ],
+)
+def test_relay_cudnn_softmax(shape, axis, dtype):
+    x = tvm.relay.var("x", tvm.relay.TensorType(shape, dtype))
+    softmax = relay.op.nn.softmax(x, axis=axis)
+    _verify_cudnn_relay(softmax)
 
 
 if __name__ == "__main__":

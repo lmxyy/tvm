@@ -40,22 +40,47 @@ namespace te {
 
 using namespace tir;
 
+// Annotate the statement with the layout transforms and axis
+// separators of the stage.  These annotations are removed during
+// SchedulePostProcToPrimFunc.  Afterwards, layout transforms are
+// specified in the PrimFunc attrs, and the axis_separators are
+// specified in the BufferNode.
+Stmt WrapLayoutTransformationAttrs(const Stage& stage, Stmt body) {
+  if (stage->layout_transforms.size()) {
+    for (int i = 0; i < stage->op->num_outputs(); i++) {
+      body = AttrStmt(Array<ObjectRef>{stage->op.output(i), stage->layout_transforms},
+                      tir::attr::layout_transforms, 1, body);
+    }
+  }
+
+  if (stage->axis_separators.size()) {
+    for (int i = 0; i < stage->op->num_outputs(); i++) {
+      body = AttrStmt(Array<ObjectRef>{stage->op.output(i), stage->axis_separators},
+                      tir::attr::axis_separators, 1, body);
+    }
+  }
+
+  return body;
+}
+
 Stmt MakePipeline(const Stage& s, const std::unordered_map<IterVar, Range>& dom_map, Stmt consumer,
                   bool debug_keep_trivial_loop) {
   Stmt producer = s->op->BuildProvide(s, dom_map, debug_keep_trivial_loop);
   if (s->double_buffer) {
     producer = AttrStmt(s->op, tir::attr::double_buffer_scope, 1, producer);
   }
+  producer = WrapLayoutTransformationAttrs(s, producer);
   Stmt pipeline = producer;
 
   if (consumer.defined() && !is_no_op(consumer)) {
     pipeline = SeqStmt({producer, consumer});
   }
-  pipeline = s->op->BuildRealize(s, dom_map, pipeline);
-  // use attribute to mark scope of the operation.
-  pipeline = AttrStmt(s->op, tir::attr::realize_scope, StringImm(s->scope), pipeline);
 
-  return pipeline;
+  if (s->rolling_buffer) {
+    pipeline = AttrStmt(s->op, tir::attr::rolling_buffer_scope, Bool(true), pipeline);
+  }
+
+  return s->op->BuildRealize(s, dom_map, pipeline, s->scope);
 }
 
 // inject the operator's realization on the stmt.
@@ -175,8 +200,7 @@ class SchedulePostProc : public StmtExprMutator {
         thread_extent_scope_.erase(op->node.get());
         return ret;
       }
-    } else if (op->attr_key == tir::attr::realize_scope ||
-               op->attr_key == tir::attr::double_buffer_scope) {
+    } else if (op->attr_key == tir::attr::double_buffer_scope) {
       auto it = replace_op_.find(op->node.get());
       if (it != replace_op_.end()) {
         if (it->second.defined()) {
@@ -209,6 +233,23 @@ class SchedulePostProc : public StmtExprMutator {
           return this->VisitStmt(op->body);
         }
       }
+    } else if (op->attr_key == tir::attr::layout_transforms ||
+               op->attr_key == tir::attr::axis_separators) {
+      auto arr = Downcast<Array<ObjectRef>>(op->node);
+      ICHECK_EQ(arr.size(), 2);
+
+      Stmt body = op->body;
+
+      Tensor tensor = Downcast<Tensor>(arr[0]);
+      auto it = replace_op_.find(tensor->op.get());
+      if (it != replace_op_.end()) {
+        if (it->second.defined()) {
+          return AttrStmt(Array<ObjectRef>{it->second.output(tensor->value_index), arr[1]},
+                          op->attr_key, op->value, this->VisitStmt(op->body));
+        } else {
+          return this->VisitStmt(op->body);
+        }
+      }
     }
     return StmtExprMutator::VisitStmt_(op);
   }
@@ -218,7 +259,8 @@ class SchedulePostProc : public StmtExprMutator {
     auto it = replace_realize_.find(key);
     if (it != replace_realize_.end()) {
       if (it->second.defined()) {
-        Stmt ret = ProducerRealize(it->second, op->bounds, op->condition, op->body);
+        Stmt ret =
+            ProducerRealize(it->second, op->bounds, op->condition, op->body, op->storage_scope);
         return this->VisitStmt(ret);
       } else {
         return this->VisitStmt(op->body);
@@ -342,12 +384,16 @@ Stmt ScheduleOps(Schedule sch, Map<IterVar, Range> dom_map_, bool debug_keep_tri
     Stage s = sch->stages[i - 1];
     ICHECK_NE(s->attach_type, kInline) << "call schedule.normalize before scheduleops";
     ICHECK(s->op.defined());
-    // no need to specify place holder op.
-    if (s->op.as<PlaceholderOpNode>()) continue;
     // Remove grouping sugar, get the real attach spec.
     Stage attach_spec = s.GetAttachSpec();
 
-    if (scan_init.count(s->op)) {
+    if (s->op.as<PlaceholderOpNode>()) {
+      // Placeholders don't need any realize/provide statements, but
+      // may be annotated with set_physical_layout to indicate the
+      // physical layout of an input, and must still have the
+      // attribute given.
+      body = WrapLayoutTransformationAttrs(s, std::move(body));
+    } else if (scan_init.count(s->op)) {
       ICHECK(body.defined());
       InjectScanStep mu(s, scan_init.at(s->op), dom_map, true, debug_keep_trivial_loop);
       body = mu(std::move(body));
@@ -374,6 +420,7 @@ Stmt ScheduleOps(Schedule sch, Map<IterVar, Range> dom_map_, bool debug_keep_tri
           << body;
     }
   }
+
   SchedulePostProc post_proc;
   post_proc.Init(sch);
   return post_proc(std::move(body));

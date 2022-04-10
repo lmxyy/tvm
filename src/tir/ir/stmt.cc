@@ -20,10 +20,13 @@
 /*!
  * \file tvm/tir/stmt.cc
  */
+#include <tvm/arith/analyzer.h>
 #include <tvm/runtime/registry.h>
 #include <tvm/tir/op.h>
 #include <tvm/tir/op_attr_types.h>
 #include <tvm/tir/stmt.h>
+
+#include "buffer_common.h"
 
 namespace tvm {
 namespace tir {
@@ -32,7 +35,14 @@ namespace tir {
 LetStmt::LetStmt(Var var, PrimExpr value, Stmt body, Span span) {
   ICHECK(value.defined());
   ICHECK(body.defined());
-  ICHECK_EQ(value.dtype(), var.dtype());
+  auto vdtype = value.dtype();
+  // It is still valid to bind a pointer type
+  // var to a value that is of type handle.
+  if (var->type_annotation.as<PointerTypeNode>()) {
+    ICHECK(vdtype.is_handle());
+  } else {
+    ICHECK_EQ(value.dtype(), var.dtype());
+  }
 
   ObjectPtr<LetStmtNode> node = make_object<LetStmtNode>();
   node->var = std::move(var);
@@ -137,6 +147,26 @@ For::For(Var loop_var, PrimExpr min, PrimExpr extent, ForKind kind, Stmt body,
   ICHECK(loop_var.dtype().is_scalar());
   ICHECK(body.defined());
 
+  // When extent or min is an IntImm but has narrower dtype than loop_var, we directly promote them
+  // without raising errors.
+  auto try_promote_imm_dtype = [&](const PrimExpr& e) {
+    ICHECK(e.dtype().bits() <= loop_var.dtype().bits())
+        << " Loop variable's dtype (" << loop_var.dtype()
+        << ") is narrower than that of `min` or `extent` (" << e.dtype() << ")";
+    const IntImmNode* a = e.as<IntImmNode>();
+    if (a && e.dtype().bits() < loop_var.dtype().bits()) {
+      return make_const(loop_var.dtype(), a->value);
+    } else {
+      return e;
+    }
+  };
+
+  min = try_promote_imm_dtype(min);
+  extent = try_promote_imm_dtype(extent);
+
+  ICHECK(loop_var.dtype() == min.dtype()) << loop_var.dtype() << " vs " << min.dtype();
+  ICHECK(loop_var.dtype() == extent.dtype()) << loop_var.dtype() << " vs " << extent.dtype();
+
   ObjectPtr<ForNode> node = make_object<ForNode>();
   node->loop_var = std::move(loop_var);
   node->min = std::move(min);
@@ -231,11 +261,34 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 
 // Store
 Store::Store(Var buffer_var, PrimExpr value, PrimExpr index, PrimExpr predicate, Span span) {
+  LOG(FATAL) << "Unexpected use of deprecated Store node for buffer " << buffer_var->name_hint
+             << ".  Use BufferStore instead.";
   ICHECK(value.defined());
   ICHECK(index.defined());
   ICHECK(predicate.defined());
-  ICHECK_EQ(value.dtype().lanes(), index.dtype().lanes());
-  ICHECK_EQ(value.dtype().lanes(), predicate.dtype().lanes());
+
+  // Assume that the array elements have 1 lane, unless a type
+  // annotation tells us otherwise.
+  int element_lanes = 1;
+  auto pointer_type = tir::GetPointerType(buffer_var->type_annotation);
+  if (pointer_type.first) {
+    // Currently cannot check element type of array, see Load::Load
+    // for details.
+
+    // TODO(Lunderberg): Uncomment this check once it can be applied.
+    // See https://discuss.tvm.apache.org/t/pre-rfc-vectorized-tir-buffers/10615
+    // for discussion.
+
+    // ICHECK_EQ(value.dtype().element_of(), pointer_type.second.element_of())
+    //     << "Type mismatch, cannot store type " << value.dtype() << " into buffer "
+    //     << buffer_var->name_hint << " of type " << pointer_type.second;
+    element_lanes = pointer_type.second.lanes();
+  }
+
+  ICHECK((value.dtype().lanes() == element_lanes * index.dtype().lanes()) ||
+         (value.dtype().lanes() == index.dtype().lanes()));
+  ICHECK((value.dtype().lanes() == element_lanes * predicate.dtype().lanes()) ||
+         (value.dtype().lanes() == index.dtype().lanes()));
 
   ObjectPtr<StoreNode> node = make_object<StoreNode>();
   node->buffer_var = std::move(buffer_var);
@@ -309,8 +362,9 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 
 // Allocate
 Allocate::Allocate(Var buffer_var, DataType dtype, Array<PrimExpr> extents, PrimExpr condition,
-                   Stmt body, Span span) {
-  CHECK(IsPointerType(buffer_var->type_annotation, dtype))
+                   Stmt body, Map<String, ObjectRef> annotations, Span span) {
+  CHECK(IsPointerType(buffer_var->type_annotation, dtype) ||
+        (dtype.is_bool() && IsPointerType(buffer_var->type_annotation, DataType::Int(8))))
       << "The allocated data type (" << dtype
       << ") does not match the type annotation of the buffer " << buffer_var << " ("
       << buffer_var->type_annotation
@@ -330,29 +384,30 @@ Allocate::Allocate(Var buffer_var, DataType dtype, Array<PrimExpr> extents, Prim
   node->extents = std::move(extents);
   node->condition = std::move(condition);
   node->body = std::move(body);
+  node->annotations = std::move(annotations);
   node->span = std::move(span);
   data_ = std::move(node);
 }
 
-int32_t AllocateNode::constant_allocation_size(const Array<PrimExpr>& extents) {
+int64_t AllocateNode::ConstantAllocationSize(const Array<PrimExpr>& extents) {
   int64_t result = 1;
   for (size_t i = 0; i < extents.size(); ++i) {
     if (const IntImmNode* int_size = extents[i].as<IntImmNode>()) {
       result *= int_size->value;
-      if (result > std::numeric_limits<int32_t>::max()) {
+      if (result > std::numeric_limits<int64_t>::max()) {
         return 0;
       }
     } else {
       return 0;
     }
   }
-  return static_cast<int32_t>(result);
+  return static_cast<int64_t>(result);
 }
 
 TVM_REGISTER_GLOBAL("tir.Allocate")
     .set_body_typed([](Var buffer_var, DataType type, Array<PrimExpr> extents, PrimExpr condition,
-                       Stmt body, Span span) {
-      return Allocate(buffer_var, type, extents, condition, body, span);
+                       Stmt body, Map<String, ObjectRef> annotations, Span span) {
+      return Allocate(buffer_var, type, extents, condition, body, annotations, span);
     });
 
 TVM_REGISTER_NODE_TYPE(AllocateNode);
@@ -360,13 +415,15 @@ TVM_REGISTER_NODE_TYPE(AllocateNode);
 TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<AllocateNode>([](const ObjectRef& node, ReprPrinter* p) {
       auto* op = static_cast<const AllocateNode*>(node.get());
+      const auto* ptr_type = op->buffer_var->type_annotation.as<PointerTypeNode>();
+      ICHECK(ptr_type) << "The provided variable is not of pointer type";
       p->PrintIndent();
       p->stream << "allocate " << op->buffer_var << "[" << op->dtype;
       for (size_t i = 0; i < op->extents.size(); ++i) {
         p->stream << " * ";
         p->Print(op->extents[i]);
       }
-      p->stream << "]";
+      p->stream << "], storage_scope = " << ptr_type->storage_scope;
       if (!is_one(op->condition)) {
         p->stream << " if ";
         p->Print(op->condition);
@@ -375,9 +432,82 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
       p->Print(op->body);
     });
 
+// Const
+// The constructor to create a IRNode with constant data
+// depending on the type of ObjectRef, it will either
+// create AllocateConstNode with irmod_storage_idx or data
+AllocateConst::AllocateConst(Var buffer_var, DataType dtype, Array<PrimExpr> extents,
+                             ObjectRef data_or_idx, Stmt body, Span span) {
+  ICHECK(IsPointerType(buffer_var->type_annotation, dtype))
+      << "The allocated data type (" << dtype
+      << ") does not match the type annotation of the buffer " << buffer_var << " ("
+      << buffer_var->type_annotation
+      << "). The data type should be an element of the pointer type.";
+
+  for (size_t i = 0; i < extents.size(); ++i) {
+    ICHECK(extents[i].defined());
+    ICHECK(extents[i].dtype().is_scalar());
+  }
+  ICHECK(body.defined());
+  ICHECK(data_or_idx.defined());
+
+  ObjectPtr<AllocateConstNode> node = make_object<AllocateConstNode>();
+  node->buffer_var = std::move(buffer_var);
+  node->dtype = dtype;
+  node->extents = std::move(extents);
+  node->body = std::move(body);
+  node->span = std::move(span);
+  if (data_or_idx->IsInstance<runtime::NDArray::ContainerType>()) {
+    node->data = Optional<tvm::runtime::NDArray>(Downcast<runtime::NDArray>(data_or_idx));
+    node->irmod_storage_idx = Optional<Integer>();
+  } else if (data_or_idx->IsInstance<IntImmNode>()) {
+    node->data = Optional<tvm::runtime::NDArray>();
+    node->irmod_storage_idx = Optional<Integer>(Downcast<Integer>(data_or_idx));
+  } else {
+    LOG(FATAL) << "Data type not supported: " << data_or_idx->GetTypeKey();
+  }
+  data_ = std::move(node);
+}
+
+int64_t AllocateConstNode::ConstantAllocationSize(const Array<PrimExpr>& extents) {
+  int64_t result = 1;
+  for (size_t i = 0; i < extents.size(); ++i) {
+    if (const IntImmNode* int_size = extents[i].as<IntImmNode>()) {
+      result *= int_size->value;
+      if (result > std::numeric_limits<int64_t>::max()) {
+        return 0;
+      }
+    } else {
+      return 0;
+    }
+  }
+  return static_cast<int64_t>(result);
+}
+TVM_REGISTER_GLOBAL("tir.AllocateConst")
+    .set_body_typed([](Var buffer_var, DataType dtype, Array<PrimExpr> extents,
+                       ObjectRef data_or_idx, Stmt body, Span span) {
+      return AllocateConst(buffer_var, dtype, extents, data_or_idx, body, span);
+    });
+
+TVM_REGISTER_NODE_TYPE(AllocateConstNode);
+
+TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
+    .set_dispatch<AllocateConstNode>([](const ObjectRef& node, ReprPrinter* p) {
+      auto* op = static_cast<const AllocateConstNode*>(node.get());
+      p->PrintIndent();
+      p->stream << "constant " << op->buffer_var << "[" << op->dtype;
+      for (size_t i = 0; i < op->extents.size(); ++i) {
+        p->stream << " * ";
+        p->Print(op->extents[i]);
+      }
+      p->stream << "]";
+      p->stream << "\n";
+      p->Print(op->body);
+    });
+
 // ProducerRealize
 ProducerRealize::ProducerRealize(DataProducer producer, Region bounds, PrimExpr condition,
-                                 Stmt body, Span span) {
+                                 Stmt body, String storage_scope, Span span) {
   for (size_t i = 0; i < bounds.size(); ++i) {
     ICHECK(bounds[i]->min.defined());
     ICHECK(bounds[i]->extent.defined());
@@ -394,13 +524,14 @@ ProducerRealize::ProducerRealize(DataProducer producer, Region bounds, PrimExpr 
   node->condition = std::move(condition);
   node->body = std::move(body);
   node->span = std::move(span);
+  node->storage_scope = std::move(storage_scope);
   data_ = std::move(node);
 }
 
 TVM_REGISTER_GLOBAL("tir.ProducerRealize")
     .set_body_typed([](DataProducer producer, Region bounds, PrimExpr condition, Stmt body,
-                       Span span) {
-      return ProducerRealize(producer, bounds, condition, body, span);
+                       String storage_scope, Span span) {
+      return ProducerRealize(producer, bounds, condition, body, storage_scope, span);
     });
 
 TVM_REGISTER_NODE_TYPE(ProducerRealizeNode);
@@ -560,6 +691,24 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 
 // BufferStore
 BufferStore::BufferStore(Buffer buffer, PrimExpr value, Array<PrimExpr> indices, Span span) {
+  ICHECK_EQ(buffer->shape.size(), indices.size())
+      << "Buffer " << buffer->name << " is " << buffer->shape.size()
+      << "-dimensional, cannot be indexed with the " << indices.size()
+      << "-dimensional indices provided.";
+
+  for (int i = 0; i < static_cast<int>(indices.size()) - 1; i++) {
+    ICHECK(indices[i].dtype().is_scalar())
+        << "Only the last index of a buffer access may be a vector type.";
+  }
+
+  int index_lanes = indices.size() ? indices.back().dtype().lanes() : 1;
+  int buffer_lanes = buffer->dtype.lanes();
+
+  ICHECK_EQ(index_lanes * buffer_lanes, value.dtype().lanes())
+      << "Cannot store value with " << value.dtype().lanes() << ", expected value with "
+      << index_lanes * buffer_lanes << " (" << index_lanes << " index lanes * " << buffer_lanes
+      << " buffer element lanes)";
+
   ObjectPtr<BufferStoreNode> node = make_object<BufferStoreNode>();
   node->buffer = std::move(buffer);
   node->value = std::move(value);
@@ -632,6 +781,9 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 
 // BufferRegion
 BufferRegion::BufferRegion(Buffer buffer, Array<Range> region) {
+  CHECK_EQ(buffer->shape.size(), region.size())
+      << "The dimension between " << buffer << " and region " << region
+      << " mismatched, the buffer is " << buffer;
   ObjectPtr<BufferRegionNode> node = make_object<BufferRegionNode>();
   node->buffer = std::move(buffer);
   node->region = std::move(region);
@@ -649,7 +801,12 @@ BufferRegion BufferRegion::FullRegion(Buffer buffer) {
 BufferRegion BufferRegion::FromPoint(Buffer buffer, Array<PrimExpr> indices) {
   Array<Range> region;
   for (const PrimExpr& index : indices) {
-    region.push_back(Range::FromMinExtent(index, 1));
+    if (const RampNode* ramp_index = index.as<RampNode>()) {
+      region.push_back(
+          Range::FromMinExtent(ramp_index->base, ramp_index->stride * ramp_index->lanes));
+    } else {
+      region.push_back(Range::FromMinExtent(index, 1));
+    }
   }
   return BufferRegion(buffer, region);
 }
@@ -679,6 +836,49 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
 
 // MatchBufferRegion
 MatchBufferRegion::MatchBufferRegion(Buffer buffer, BufferRegion source) {
+  const Buffer& source_buffer = source->buffer;
+  arith::Analyzer analyzer;
+  // Check scope and dtype
+  CHECK_EQ(buffer.scope(), source_buffer.scope())
+      << "MatchBuffer " << buffer << " scope mismatch:" << buffer.scope() << " vs. "
+      << source_buffer.scope();
+  CHECK_EQ(buffer->dtype, source_buffer->dtype)
+      << "MatchBuffer " << buffer << " data type mismatch:" << buffer->dtype << " vs. "
+      << source_buffer->dtype;
+
+  // Check data_alignment
+  CHECK(source_buffer->data_alignment % buffer->data_alignment == 0)
+      << "Trying to match buffer to another one with lower alignment requirement "
+      << " required_alignment=" << buffer->data_alignment
+      << ", provided_alignment=" << source_buffer->data_alignment;
+
+  // Check BufferType. AutoBroadcast is not allowed for now.
+  CHECK(buffer->buffer_type == BufferType::kDefault &&
+        source_buffer->buffer_type == BufferType::kDefault)
+      << "AutoBroadcast is not allowed in MatchBuffer";
+
+  // Validate shape
+  CHECK(source->region.size() >= buffer->shape.size())
+      << "Dimension of source Region expected to be larger or equal than target buffer shape, but "
+         "got "
+      << source->region.size() << " vs. " << buffer->shape.size();
+  size_t offset = source->region.size() - buffer->shape.size();
+  for (size_t i = 0; i < offset; ++i) {
+    CHECK(analyzer.CanProve(source->region[i]->extent == 1))
+        << "The higher dimension should be 1, but got " << source->region[i]->extent << ".";
+  }
+  for (size_t i = 0; i < buffer->shape.size(); ++i) {
+    const Range& source_range = source->region[i + offset];
+    const PrimExpr& buffer_shape = buffer->shape[i];
+    if (!buffer_shape->IsInstance<VarNode>()) {
+      CHECK(analyzer.CanProve(source_range->extent == buffer_shape))
+          << "The dimension mismatched between source region and target buffer shape, got "
+          << source_range->extent << " vs. " << buffer_shape << ".";
+    }
+  }
+  // Note that we do not check elem_offset and strides in this function
+
+  // Construction
   ObjectPtr<MatchBufferRegionNode> node = make_object<MatchBufferRegionNode>();
   node->buffer = std::move(buffer);
   node->source = std::move(source);
@@ -695,7 +895,7 @@ TVM_STATIC_IR_FUNCTOR(ReprPrinter, vtable)
     .set_dispatch<MatchBufferRegionNode>([](const ObjectRef& node, ReprPrinter* p) {
       auto* op = static_cast<const MatchBufferRegionNode*>(node.get());
       p->PrintIndent();
-      p->stream << op->buffer->name << " = match_buffer_region(";
+      p->stream << op->buffer->name << " = match_buffer(";
       p->Print(op->source);
       p->stream << ")\n";
     });

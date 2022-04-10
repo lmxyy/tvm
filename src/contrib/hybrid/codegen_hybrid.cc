@@ -69,6 +69,9 @@ void CodeGenHybrid::PrintType(DataType t, std::ostream& os) {
   } else if (t.is_int()) {
     os << "int";
     ICHECK(t.bits() == 8 || t.bits() == 16 || t.bits() == 32 || t.bits() == 64);
+  } else if (t.is_bfloat16()) {
+    os << "bfloat";
+    ICHECK(t.bits() == 16);
   } else {
     ICHECK(t.is_uint()) << "Unsupported type " << t;
     os << "uint";
@@ -271,6 +274,14 @@ void CodeGenHybrid::VisitExpr_(const LoadNode* op, std::ostream& os) {  // NOLIN
 
 void CodeGenHybrid::VisitStmt_(const StoreNode* op) { LOG(FATAL) << "Phase 0 has no Store(s)!"; }
 
+void CodeGenHybrid::VisitExpr_(const BufferLoadNode* op, std::ostream& os) {  // NOLINT(*)
+  LOG(FATAL) << "Phase 0 has no BufferLoad(s)!";
+}
+
+void CodeGenHybrid::VisitStmt_(const BufferStoreNode* op) {
+  LOG(FATAL) << "Phase 0 has no BufferStore(s)!";
+}
+
 void CodeGenHybrid::VisitExpr_(const LetNode* op, std::ostream& os) {  // NOLINT(*)
   LOG(FATAL) << "Phase 0 has no Let(s)!";
 }
@@ -315,10 +326,6 @@ void CodeGenHybrid::VisitStmt_(const AttrStmtNode* op) {
     indent_ += tab_;
     PrintStmt(op->body);
     indent_ -= tab_;
-  } else if (op->attr_key == tir::attr::realize_scope) {
-    auto v = Downcast<Operation>(op->node);
-    alloc_storage_scope_[v] = op->value.as<StringImmNode>()->value;
-    PrintStmt(op->body);
   } else {
     // For now we ignore the unsupported AttrStmt
     PrintStmt(op->body);
@@ -327,8 +334,7 @@ void CodeGenHybrid::VisitStmt_(const AttrStmtNode* op) {
 
 void CodeGenHybrid::VisitStmt_(const ProducerRealizeNode* op) {
   auto tensor = Downcast<Tensor>(op->producer);
-  ICHECK(alloc_storage_scope_.count(tensor->op));
-  if (!alloc_storage_scope_[tensor->op].empty()) {
+  if (!op->storage_scope.empty()) {
     PrintIndent();
     stream << GetTensorID(tensor) << " = allocate((";
     for (size_t i = 0; i < op->bounds.size(); ++i) {
@@ -339,7 +345,7 @@ void CodeGenHybrid::VisitStmt_(const ProducerRealizeNode* op) {
     stream << "), '";
     PrintType(tensor->dtype, stream);
     stream << "', '";
-    stream << alloc_storage_scope_[tensor->op] << "')\n";
+    stream << op->storage_scope << "')\n";
   }
   PrintStmt(op->body);
 }

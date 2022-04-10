@@ -207,8 +207,7 @@ class HybridParser(ast.NodeVisitor):
             _domain = [Range.from_min_extent(0, i) for i in _buf.shape]
             _dtype = _buf.dtype
             _true = tvm.runtime.convert(True)
-            body = tvm.tir.ProducerRealize(_buf, _domain, _true, body)
-            body = tvm.tir.AttrStmt(_buf.op, "realize_scope", tvm.runtime.convert(_scope), body)
+            body = tvm.tir.ProducerRealize(_buf, _domain, _true, body, tvm.runtime.convert(_scope))
 
         for elem in to_pop:
             self.symbols.pop(elem)
@@ -512,7 +511,13 @@ class HybridParser(ast.NodeVisitor):
 
         if iter_var is None:
             _internal_assert(kind is not None, "The loop iterating function parse error!")
-            offset = iter_var = tvm.te.var(_name)
+            if isinstance(ext, _expr.PrimExpr):
+                dtype = ext.dtype
+            elif isinstance(ext, int):
+                dtype = "int32"
+            else:
+                raise NotImplementedError(f"Unsupported type of ext: {type(ext)}")
+            offset = iter_var = tvm.te.var(_name, dtype=dtype)
             if not tvm.tir.analysis.expr_deep_equal(low, tvm.runtime.const(0, "int32")):
                 offset = iter_var + low
             self.add_symbol(_name, Symbol.LoopVar, offset)

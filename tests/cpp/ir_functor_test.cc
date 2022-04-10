@@ -60,8 +60,9 @@ TEST(IRF, VisitPrimFuncs) {
   using namespace tvm;
   using namespace tvm::tir;
   PrimFunc prim_func(/*params=*/{}, /*body=*/Evaluate(Integer(0)));
-  relay::Function relay_func(/*params=*/{}, /*body=*/relay::Expr(nullptr),
-                             /*ret_type=*/relay::Type{nullptr}, /*ty_params=*/{});
+  auto c_data = tvm::runtime::NDArray::Empty({1, 2, 3}, {kDLFloat, 32, 1}, {kDLCPU, 0});
+  relay::Function relay_func(/*params=*/{}, /*body=*/relay::Expr(relay::Constant(c_data)),
+                             /*ret_type=*/relay::Type(), /*ty_params=*/{});
   IRModule mod({
       {GlobalVar("main"), prim_func},
       {GlobalVar("main2"), relay_func},
@@ -323,10 +324,4 @@ TEST(IRF, StmtMutator) {
     ICHECK(new_block->writes[0]->region[0]->min.same_as(x));
     ICHECK(new_block->match_buffers[0]->source->region[0]->min.same_as(x));
   }
-}
-
-int main(int argc, char** argv) {
-  testing::InitGoogleTest(&argc, argv);
-  testing::FLAGS_gtest_death_test_style = "threadsafe";
-  return RUN_ALL_TESTS();
 }

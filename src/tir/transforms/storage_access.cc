@@ -34,15 +34,25 @@ namespace tvm {
 namespace tir {
 
 void StorageAccessVisitor::VisitExpr_(const LoadNode* op) {
-  const VarNode* buf = op->buffer_var.as<VarNode>();
+  LOG(FATAL) << "Unexpected use of deprecated LoadNode.  Please use BufferLoadNode instead.";
+}
+
+void StorageAccessVisitor::VisitStmt_(const StoreNode* op) {
+  LOG(FATAL) << "Unexpected use of deprecated StoreNode.  Please use BufferStoreNode instead.";
+}
+
+void StorageAccessVisitor::VisitExpr_(const BufferLoadNode* op) {
+  Var buf = op->buffer->data;
   StorageScope scope = GetScope(buf);
-  if (Enabled(buf, scope)) {
+  if (Enabled(buf.get(), scope)) {
     ICHECK(allow_append_) << op << " " << scope.to_string();
     AccessEntry e;
     e.threads = env_threads();
-    e.buffer = op->buffer_var;
+    e.buffer = buf;
     e.dtype = op->dtype.element_of();
-    e.touched = arith::IntSet::Vector(op->index);
+    for (const auto& index : op->indices) {
+      e.touched.push_back(arith::IntSet::Vector(index));
+    }
     e.type = kRead;
     e.scope = scope;
     curr_stmt_.access.emplace_back(std::move(e));
@@ -51,18 +61,21 @@ void StorageAccessVisitor::VisitExpr_(const LoadNode* op) {
   StmtExprVisitor::VisitExpr_(op);
 }
 
-void StorageAccessVisitor::VisitStmt_(const StoreNode* op) {
+void StorageAccessVisitor::VisitStmt_(const BufferStoreNode* op) {
   allow_append_ = true;
   ICHECK_EQ(curr_stmt_.access.size(), 0U);
   curr_stmt_.stmt = op;
-  const VarNode* buf = op->buffer_var.as<VarNode>();
+
+  Var buf = op->buffer->data;
   StorageScope scope = GetScope(buf);
-  if (Enabled(buf, scope)) {
+  if (Enabled(buf.get(), scope)) {
     AccessEntry e;
     e.threads = env_threads();
-    e.buffer = op->buffer_var;
+    e.buffer = buf;
     e.dtype = op->value.dtype().element_of();
-    e.touched = arith::IntSet::Vector(op->index);
+    for (const auto& index : op->indices) {
+      e.touched.push_back(arith::IntSet::Vector(index));
+    }
     e.type = kWrite;
     e.scope = scope;
     curr_stmt_.access.emplace_back(std::move(e));
@@ -90,11 +103,7 @@ void StorageAccessVisitor::VisitStmt_(const EvaluateNode* op) {
 }
 
 void StorageAccessVisitor::VisitStmt_(const AttrStmtNode* op) {
-  if (op->attr_key == attr::storage_scope) {
-    const VarNode* buf = op->node.as<VarNode>();
-    storage_scope_[buf] = StorageScope::Create(op->value.as<StringImmNode>()->value);
-    StmtExprVisitor::VisitStmt_(op);
-  } else if (op->attr_key == attr::double_buffer_write) {
+  if (op->attr_key == attr::double_buffer_write) {
     ICHECK(double_buffer_write_ == nullptr);
     double_buffer_write_ = op->node.as<VarNode>();
     scope_.push_back(std::vector<StmtEntry>());
@@ -155,8 +164,12 @@ void StorageAccessVisitor::VisitStmt_(const ForNode* op) {
         arith::IntSet::FromRange(Range::FromMinExtent(op->min, op->extent));
     for (AccessEntry& e : s.access) {
       if (e.buffer.defined()) {
-        ICHECK(e.touched.defined());
-        e.touched = arith::EvalSet(e.touched, relax_map);
+        ICHECK(e.touched.size());
+        Array<arith::IntSet> new_touched;
+        for (const auto& touched : e.touched) {
+          new_touched.push_back(arith::EvalSet(touched, relax_map));
+        }
+        e.touched = std::move(new_touched);
       }
     }
   }
@@ -176,6 +189,7 @@ void StorageAccessVisitor::VisitStmt_(const IfThenElseNode* op) {
   scope_.pop_back();
   if (op->else_case.defined()) {
     scope_.push_back(std::vector<StmtEntry>());
+    this->VisitStmt(op->else_case);
     auto v = Summarize(std::move(scope_.back()), nullptr);
     scope_.pop_back();
     s.access.insert(s.access.end(), v.begin(), v.end());
@@ -199,8 +213,8 @@ void StorageAccessVisitor::VisitStmt_(const WhileNode* op) {
 
 void StorageAccessVisitor::VisitExpr_(const CallNode* op) {
   if (op->op.same_as(builtin::address_of())) {
-    const LoadNode* l = op->args[0].as<LoadNode>();
-    StmtExprVisitor::VisitExpr_(l);
+    const BufferLoadNode* load = op->args[0].as<BufferLoadNode>();
+    StmtExprVisitor::VisitExpr_(load);
   } else if (op->op.same_as(builtin::tvm_access_ptr())) {
     ICHECK_EQ(op->args.size(), 5U);
     DataType dtype = op->args[0].dtype();
@@ -208,7 +222,7 @@ void StorageAccessVisitor::VisitExpr_(const CallNode* op) {
     PrimExpr offset = op->args[2];
     PrimExpr extent = op->args[3];
     const IntImmNode* flag = op->args[4].as<IntImmNode>();
-    StorageScope scope = GetScope(buffer);
+    StorageScope scope = GetScope(GetRef<Var>(buffer));
     // The buffer scope.
     if (Enabled(buffer, scope)) {
       ICHECK(allow_append_);
@@ -216,7 +230,7 @@ void StorageAccessVisitor::VisitExpr_(const CallNode* op) {
       e.threads = env_threads();
       e.dtype = dtype;
       e.buffer = Downcast<Var>(op->args[1]);
-      e.touched = arith::IntSet::FromRange(Range::FromMinExtent(offset, extent));
+      e.touched = {arith::IntSet::FromRange(Range::FromMinExtent(offset, extent))};
       e.scope = scope;
       if (flag->value & 1) {
         e.type = kRead;
@@ -244,12 +258,11 @@ void StorageAccessVisitor::VisitExpr_(const CallNode* op) {
   }
 }
 
-StorageScope StorageAccessVisitor::GetScope(const VarNode* buf) const {
-  auto it = storage_scope_.find(buf);
-  StorageScope s;
-  s.rank = StorageRank::kGlobal;
-  if (it == storage_scope_.end()) return s;
-  return it->second;
+StorageScope StorageAccessVisitor::GetScope(Var buffer_var) const {
+  if (buffer_var->type_annotation.as<PointerTypeNode>()) {
+    return StorageScope::Create(GetPtrStorageScope(buffer_var));
+  }
+  return StorageScope();  // global by default
 }
 
 }  // namespace tir

@@ -630,6 +630,22 @@ class BufferLoadNode : public PrimExprNode {
 
   static constexpr const char* _type_key = "tir.BufferLoad";
   TVM_DECLARE_FINAL_OBJECT_INFO(BufferLoadNode, PrimExprNode);
+
+ private:
+  /*! \brief Set the dtype based on the buffer/indices
+   *
+   * Usually, the BufferLoad's dtype will be the same dtype as the
+   * buffer.  This may have a different number of lanes than the
+   * buffer's dtype if index values have more than 1 lane.
+   *
+   * This function should only be called during construction and after
+   * CopyOnWrite.  Friend class used here to restrict usage.
+   */
+  void LegalizeDType();
+  friend class BufferLoad;
+  friend class CustomDatatypesLowerer;
+  friend class VectorTypeRewriter;
+  friend class Vectorizer;
 };
 
 /*!
@@ -947,6 +963,7 @@ class ShuffleNode : public PrimExprNode {
   Array<PrimExpr> indices;
 
   void VisitAttrs(AttrVisitor* v) {
+    v->Visit("dtype", &dtype);
     v->Visit("vectors", &vectors);
     v->Visit("indices", &indices);
     v->Visit("span", &span);
@@ -1125,6 +1142,9 @@ class AnyNode : public PrimExprNode {
 
   /*! \brief Convert to var. */
   Var ToVar() const { return Var("any_dim", DataType::Int(32)); }
+
+  /*! \brief Convert to SizeVar. */
+  SizeVar ToSizeVar() const { return SizeVar("any_dim", DataType::Int(32)); }
 
   static constexpr const char* _type_key = "tir.Any";
   TVM_DECLARE_FINAL_OBJECT_INFO(AnyNode, PrimExprNode);
