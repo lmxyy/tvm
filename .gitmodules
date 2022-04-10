@@ -16,3 +16,6 @@
 [submodule "3rdparty/cutlass"]
 	path = 3rdparty/cutlass
 	url = https://github.com/NVIDIA/cutlass.git
+[submodule "python/tvm/chameleon"]
+	path = python/tvm/chameleon
+	url = https://github.com/anony-sub/chameleon.git
